@@ -56,7 +56,10 @@ class Sorter(Generic[_T]):
             `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
         threads: The threads that sort each half and compress each run: with 1, the thread that
-            spills it, and with more, a pool of this sorter's own.
+            spills it, and with more, a pool of this sorter's own. Writing a run holds a 128 KiB
+            block and room for it compressed, about 269 KiB, beyond `max_bytes`, for each block
+            compressed at once: one with 1 thread, and with more, two for each thread, but at most
+            16, about 4.2 MiB.
 
     Raises:
         TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.

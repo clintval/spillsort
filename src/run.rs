@@ -18,6 +18,9 @@ const BLOCK: usize = 128 << 10;
 /// The bytes before each block: its compressed and uncompressed lengths.
 const HEADER: usize = 8;
 
+/// The most blocks a run writer compresses at once, on a pool of any size.
+const MOST_BLOCKS: usize = 16;
+
 /// A run on disk, the number of records written to it, and the bytes they take uncompressed.
 #[derive(Clone, Debug)]
 pub(crate) struct Run {
@@ -63,7 +66,7 @@ impl Block {
 }
 
 /// Writes records to a new run, in the order given, a compressed block at a time, or, given a
-/// pool, compressing two blocks for each of its threads at once.
+/// pool, compressing two blocks for each of its threads at once, and at most 16.
 pub(crate) struct RunWriter {
     file: File,
     path: PathBuf,
@@ -83,7 +86,7 @@ impl RunWriter {
             .map_err(|error| with_path(&error, &path))?;
         let blocks = pool
             .as_ref()
-            .map_or(1, |pool| 2 * pool.current_num_threads());
+            .map_or(1, |pool| (2 * pool.current_num_threads()).min(MOST_BLOCKS));
         Ok(RunWriter {
             file,
             path,
@@ -407,6 +410,20 @@ mod tests {
         let bytes = fs::read(&pooled.path).unwrap();
         assert!(block_offsets(&bytes).len() > 6);
         assert_eq!(bytes, fs::read(&alone.path).unwrap());
+    }
+
+    #[test]
+    fn a_pool_compresses_two_blocks_for_each_thread_and_at_most_16() {
+        let dir = tempfile::tempdir().unwrap();
+        for (threads, blocks) in [(2, 4), (8, 16), (9, 16), (64, 16)] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let path = dir.path().join(format!("{threads}"));
+            let writer = RunWriter::create(path, Some(Arc::new(pool))).unwrap();
+            assert_eq!(writer.blocks.len(), blocks, "{threads} threads");
+        }
     }
 
     #[test]
