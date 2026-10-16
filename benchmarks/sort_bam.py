@@ -1,8 +1,9 @@
 """Compare sorting a BAM by coordinate with samtools sort and with spillsort holding pysam records.
 
 Every method reads the same randomly ordered BAM of paired reads and writes a BAM. Each runs in
-its own process, which reports its time and the most memory it used beyond what it used after
-importing; this includes samtools, since `pysam.sort` runs it in the same process. The `copy`
+its own process, which reports its time, the bytes it wrote to temporary files, and the most memory
+it used beyond what it used after importing; this includes samtools, since `pysam.sort` runs it in
+the same process. The `copy`
 methods only read and write, which is the least any method holding pysam records can take. Each
 sorted output must index without a sort-order error, every output must hold every input record,
 and every sorted output must list the same positions in the same order.
@@ -34,6 +35,8 @@ from pysam import AlignmentFile
 from pysam import AlignmentHeader
 from pysam.version import __samtools_version__ as samtools_version
 from pysam.version import __version__ as pysam_version
+
+from benchmarks.spilled import Spilled
 
 METHODS = [
     "copy records",
@@ -261,12 +264,14 @@ def peak_megabytes() -> float:
 def measure(method: str, threads: int, max_bytes: int, source: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="spillsort-benchmark-") as directory:
         before = peak_megabytes()
-        start = time.perf_counter()
-        out = run(method, threads, max_bytes, source, Path(directory))
-        seconds = time.perf_counter() - start
+        with Spilled(Path(directory), frozenset({"out.bam"})) as spilled:
+            start = time.perf_counter()
+            out = run(method, threads, max_bytes, source, Path(directory))
+            seconds = time.perf_counter() - start
         peak = peak_megabytes() - before
         checked = digests(out, indexed=not method.startswith("copy"))
-    print(json.dumps({"method": method, "seconds": seconds, "megabytes": peak, **checked}))
+    result = {"method": method, "seconds": seconds, "megabytes": peak}
+    print(json.dumps({**result, "spilled": spilled.megabytes, **checked}))
 
 
 def main() -> None:
@@ -285,8 +290,8 @@ def main() -> None:
     print(f"{count:,} records, max_bytes of {max_megabytes} MiB, {cores} cores, best of 3")
     print(f"Python {platform.python_version()} on {platform.machine()}, {versions}", end="")
     print(f", load average {load:.1f}\n")
-    print(f"| {'Method':<15} | Threads | {'Seconds':>7} | {'Peak MB':>7} |")
-    print(f"|{'-' * 17}|{'-' * 8}:|{'-' * 8}:|{'-' * 8}:|")
+    print(f"| {'Method':<15} | Threads | {'Seconds':>7} | {'Peak MB':>7} | Spilled MB |")
+    print(f"|{'-' * 17}|{'-' * 8}:|{'-' * 8}:|{'-' * 8}:|{'-' * 11}:|")
     positions: set[str] = set()
     orders: set[str] = set()
     for method in METHODS:
@@ -306,10 +311,9 @@ def main() -> None:
                     positions.add(result["positions"])
                     orders.add(result["order"])
             best = min(results, key=lambda result: result["seconds"])
-            seconds, megabytes = best["seconds"], best["megabytes"]
-            print(
-                f"| {method:<15} | {threads:>7} | {seconds:7.2f} | {megabytes:7.0f} |", flush=True
-            )
+            seconds, megabytes, spilled = best["seconds"], best["megabytes"], best["spilled"]
+            row = f"| {method:<15} | {threads:>7} | {seconds:7.2f} | {megabytes:7.0f} |"
+            print(f"{row} {spilled:10.0f} |", flush=True)
     if len(positions) != 1:
         raise SystemExit("the sorted outputs do not list the same positions")
     same = "the same records" if len(orders) == 1 else "records that differ among ties"

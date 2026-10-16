@@ -1,10 +1,11 @@
 """Compare spillsort with a pure-Python external sorter of the same API and with `sorted()`.
 
-Each method runs in its own process, which reports its time and the most memory it used beyond
-what it used after importing. The items are random `(refname, start, end, name)` tuples sorted by
-reference and start. `items` methods add them and read them back, pickled while they wait.
-`lines` methods add `(key, line)` pairs that are already encoded and write the sorted lines to a
-file. The `generate` methods only make the items, which is the least any method can take.
+Each method runs in its own process, which reports its time, the most memory it used beyond what it
+used after importing, and the bytes it wrote to temporary files. The items are random
+`(refname, start, end, name)` tuples sorted by reference and start. `items` methods add them and
+read them back, pickled while they wait. `lines` methods add `(key, line)` pairs that are already
+encoded and write the sorted lines to a file. The `generate` methods only make the items, which is
+the least any method can take.
 
 Run with `uv run python -m benchmarks.benchmark [records] [max_megabytes]`.
 """
@@ -27,6 +28,7 @@ from typing import Any
 import spillsort
 
 from benchmarks import baseline
+from benchmarks.spilled import Spilled
 
 Item = tuple[str, int, int, str]
 Key = tuple[str, int]
@@ -97,11 +99,13 @@ def run(method: str, count: int, max_bytes: int, directory: Path) -> None:
 def measure(method: str, count: int, max_bytes: int) -> None:
     with tempfile.TemporaryDirectory(prefix="spillsort-benchmark-") as directory:
         before = peak_megabytes()
-        start = time.perf_counter()
-        run(method, count, max_bytes, Path(directory))
-        seconds = time.perf_counter() - start
+        with Spilled(Path(directory), frozenset({"out.txt"})) as spilled:
+            start = time.perf_counter()
+            run(method, count, max_bytes, Path(directory))
+            seconds = time.perf_counter() - start
         peak = peak_megabytes() - before
-    print(json.dumps({"method": method, "seconds": seconds, "megabytes": peak}))
+    result = {"method": method, "seconds": seconds, "megabytes": peak}
+    print(json.dumps({**result, "spilled": spilled.megabytes}))
 
 
 def main() -> None:
@@ -110,10 +114,11 @@ def main() -> None:
         return
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 2_000_000
     max_megabytes = int(sys.argv[2]) if len(sys.argv) > 2 else 64
-    cores = os.cpu_count() or 1
-    print(f"{count:,} records, max_bytes of {max_megabytes} MiB, {cores} cores, best of 3\n")
-    print(f"| {'Method':<16} | {'Seconds':>7} | {'Peak MB':>7} |")
-    print(f"|{'-' * 18}|{'-' * 8}:|{'-' * 8}:|")
+    cores, load = os.cpu_count() or 1, os.getloadavg()[0]
+    print(f"{count:,} records, max_bytes of {max_megabytes} MiB, {cores} cores, best of 3", end="")
+    print(f", load average {load:.1f}\n")
+    print(f"| {'Method':<16} | {'Seconds':>7} | {'Peak MB':>7} | Spilled MB |")
+    print(f"|{'-' * 18}|{'-' * 8}:|{'-' * 8}:|{'-' * 11}:|")
     for method in METHODS:
         results: list[dict[str, Any]] = []
         for _ in range(3):
@@ -122,7 +127,8 @@ def main() -> None:
             output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
             results.append(json.loads(output))
         best = min(results, key=lambda result: result["seconds"])
-        print(f"| {method:<16} | {best['seconds']:7.2f} | {best['megabytes']:7.0f} |", flush=True)
+        seconds, megabytes, spilled = best["seconds"], best["megabytes"], best["spilled"]
+        print(f"| {method:<16} | {seconds:7.2f} | {megabytes:7.0f} | {spilled:10.0f} |", flush=True)
 
 
 if __name__ == "__main__":
