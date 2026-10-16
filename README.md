@@ -136,22 +136,6 @@ Reading needs a 256 KiB buffer for each spilled run, and when there are more run
 Spilled runs go to a private directory in `tmp_dir`, or in the system's temporary directory, which is removed when reading ends, on `close()`, when a `with` block exits, or when the sorter is garbage collected.
 A sorter is read once, and threads sharing a sorter take turns.
 
-## Benchmarks
-
-Sorting 10 million `(refname, start, end, name)` tuples by reference and start, on an Apple M3 Max, with `max_bytes` of 64 MiB for both external sorters:
-
-| Method                            | Seconds | Peak MB |
-|-----------------------------------|--------:|--------:|
-| `sorted()` in memory, tuples      |   18.76 |    2909 |
-| pure-Python external sort, tuples |   25.52 |     143 |
-| `spillsort`, tuples               |   10.23 |     101 |
-| `sorted()` in memory, lines       |   29.67 |    2604 |
-| pure-Python external sort, lines  |   23.56 |     143 |
-| `spillsort`, lines                |    7.74 |     107 |
-
-Making the tuples alone takes 4.41 seconds, and making the lines 6.04.
-See [`benchmarks/README.md`](https://github.com/clintval/spillsort/blob/main/benchmarks/README.md) for what each method does and how to run them.
-
 ## Development and Testing
 
 See the [contributing guide](https://github.com/clintval/spillsort/blob/main/CONTRIBUTING.md) for more information.
