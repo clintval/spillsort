@@ -78,11 +78,6 @@ class Sorter(Generic[T]):
     def add(self, item: T, /) -> None:
         self.add_encoded(self.key(item), self.codec.encode(item))
 
-    def extend(self, items: Iterable[T], /) -> None:
-        key, encode, add = self.key, self.codec.encode, self.add_encoded
-        for item in items:
-            add(key(item), encode(item))
-
     def add_encoded(self, key: Any, payload: bytes, /) -> None:
         if self.done:
             raise RuntimeError("cannot add to a sorter once it has been read")
@@ -92,15 +87,13 @@ class Sorter(Generic[T]):
         if self.held >= self.max_bytes:
             self.spill()
 
-    def extend_encoded(self, pairs: Iterable[tuple[Any, bytes]], /) -> None:
-        add = self.add_encoded
-        for key, payload in pairs:
-            add(key, payload)
-
     def __len__(self) -> int:
         return self.added
 
-    def __iter__(self) -> Iterator[T]:
+    def sort(self, items: Iterable[T] = (), /) -> Iterator[T]:
+        key, encode, add = self.key, self.codec.encode, self.add_encoded
+        for item in items:
+            add(key(item), encode(item))
         return map(self.codec.decode, self.encoded())
 
     def encoded(self) -> Iterator[bytes]:

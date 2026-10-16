@@ -125,8 +125,7 @@ jobs:
           import spillsort
 
           sorter = spillsort.Sorter(max_bytes=64)
-          sorter.extend(["source", "from", "built"])
-          assert list(sorter) == ["built", "from", "source"]
+          assert list(sorter.sort(["source", "from", "built"])) == ["built", "from", "source"]
           print("spillsort builds from its source distribution")
           PY
 

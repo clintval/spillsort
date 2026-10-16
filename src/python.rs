@@ -6,7 +6,7 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 
@@ -16,6 +16,7 @@ use pyo3::types::{IntoPyDict, PyBytes, PyFloat, PyInt, PyList, PyString, PyTuple
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::key;
+use crate::sorter::POLL;
 use crate::{
     Config, DEFAULT_MAX_BYTES, DEFAULT_MAX_OPEN, Error, MIN_MAX_BYTES, MIN_MAX_OPEN, Merged,
     Sorter as CoreSorter,
@@ -50,6 +51,30 @@ fn read_twice_error() -> PyErr {
 
 fn added_after_read_error() -> PyErr {
     PyRuntimeError::new_err("cannot add to a sorter once it has been read")
+}
+
+fn stopped_error() -> PyErr {
+    PyRuntimeError::new_err("the sorter stopped when reading it failed or was interrupted")
+}
+
+fn check_signals(py: Python<'_>) -> PyResult<()> {
+    py.check_signals()
+}
+
+/// Runs any signal handlers, as Python does between bytecodes, from a thread that has detached,
+/// and returns true once one has raised, keeping what it raised.
+fn interrupted(raised: &mut Option<PyErr>) -> bool {
+    if raised.is_none()
+        && let Err(error) = Python::attach(check_signals)
+    {
+        *raised = Some(error);
+    }
+    raised.is_some()
+}
+
+/// What a signal handler raised, if one did, or else this error.
+fn raised_or(raised: &mut Option<PyErr>, error: Error) -> PyErr {
+    raised.take().unwrap_or_else(|| to_python(error))
 }
 
 /// Returns an address that no other running thread shares.
@@ -166,6 +191,7 @@ enum State {
     Adding(CoreSorter),
     Reading(Merged, Batch),
     Read,
+    Stopped,
     Closed,
 }
 
@@ -178,7 +204,9 @@ impl State {
             return Ok(());
         }
         let filled = batch.fill(merged);
-        if filled.is_err() || batch.is_drained() {
+        if filled.is_err() {
+            *self = State::Stopped;
+        } else if batch.is_drained() {
             *self = State::Read;
         }
         filled.map_err(to_python)
@@ -188,10 +216,18 @@ impl State {
         matches!(self, State::Reading(_, batch) if batch.is_drained())
     }
 
+    /// Stops reading after an error or a signal, dropping the merge, which removes what was
+    /// spilled.
+    fn end(&mut self) {
+        if matches!(self, State::Reading(..)) {
+            *self = State::Stopped;
+        }
+    }
+
     fn next_value(&mut self) -> PyResult<Option<&[u8]>> {
         match self {
             State::Reading(_, batch) => Ok(batch.take()),
-            State::Adding(_) | State::Read => Ok(None),
+            State::Adding(_) | State::Read | State::Stopped => Ok(None),
             State::Closed => Err(closed_error()),
         }
     }
@@ -322,30 +358,44 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
         .map_or_else(|_| "?".to_owned(), |name| name.to_string())
 }
 
-/// Sort more items than fit in memory: add them, then read them once, sorted.
+/// Sort more items than fit in memory: add them, then sort them once.
 ///
-/// Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`,
-/// or by pickle, once, as it is added. Keys and bytes are held in up to `max_bytes` of memory.
-/// Once half of that fills, a background thread sorts it and writes it to a private directory in
-/// `tmp_dir` while the other half fills. Reading merges what was written with what is held, so
-/// items come out in key order, and items with equal keys come out in the order they were added.
+/// Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`, or
+/// by pickle, once, as it is added. Keys and bytes, and 16 bytes more for each item, are held in at
+/// most `max_bytes` of memory, unless one item alone needs more. Once half of that is full, a
+/// background thread sorts it and writes it to a private directory in `tmp_dir` while the other
+/// half fills. Sorting merges what was written with what is held, so items come out in key order,
+/// and items with equal keys come out in the order they were added. A merge reads at most
+/// `max_open` runs at once, each through a 256 KiB buffer and holding its next item, so it
+/// takes about `max_open` times the largest item, plus those buffers, besides what is held.
 ///
 /// The private directory is removed when reading ends, on `close()`, when a `with` block exits,
-/// or when the sorter is garbage collected. Threads sharing a sorter take turns.
+/// or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
+/// must not be shared across a fork: make a new one in the child.
+///
+/// Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
+/// reading; an interrupted merge or read ends the sort and removes what was spilled, which can take
+/// a moment when much was spilled, and the sorter then refuses to be read again.
 ///
 /// Args:
 ///     key: A function returning the sort key of an item: an int, float, str, bytes, None, or a
 ///         tuple or list of them, compared as Python compares them. None sorts items by
-///         themselves.
+///         themselves. NumPy integers, like anything with `__index__`, are ints, and
+///         `np.float64`, `np.str_` and `np.bytes_` are a float, a str and bytes; other NumPy
+///         scalars, such as `np.float32` and `np.bool_`, raise TypeError, so convert them first.
 ///     codec: Encodes each item into bytes and decodes it back; pickle if None.
-///     max_bytes: The most bytes of keys and encoded items to hold in memory, at least 2.
-///     tmp_dir: The directory to spill into, or None for the system's temporary directory.
+///     max_bytes: The most memory to hold keys and encoded items in, counting 16 bytes more for
+///         each, at least 2.
+///     tmp_dir: The directory to spill into, which must be writable, or None for
+///         `tempfile.gettempdir()`.
 ///     max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
+///     threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
+///         a pool of this sorter's own.
 ///
 /// Raises:
 ///     TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.
-///     ValueError: If `max_bytes` or `max_open` is less than 2.
-///     OSError: If `tmp_dir` is not a directory.
+///     ValueError: If `max_bytes` or `max_open` is less than 2, or `threads` is less than 1.
+///     OSError: If `tmp_dir` is not a directory, or a directory cannot be made in it.
 #[pyclass(module = "spillsort", name = "Sorter", frozen, generic)]
 struct PySorter {
     state: Arc<Lock<State>>,
@@ -361,14 +411,27 @@ impl PySorter {
         match self.status.load(Ordering::Acquire) {
             ADDING => Ok(()),
             CLOSED => Err(closed_error()),
-            _ => Err(added_after_read_error()),
+            _ => match self.state.try_lock() {
+                Some(state) if matches!(*state, State::Stopped) => Err(stopped_error()),
+                _ => Err(added_after_read_error()),
+            },
         }
     }
 
+    /// Adds a record, first waiting without the GIL, as a signal allows, for a spill that pushing
+    /// it would wait for.
     fn push(&self, py: Python<'_>, key: &[u8], payload: &[u8]) -> PyResult<()> {
         let push = |state: &mut State| match state {
-            State::Adding(sorter) => sorter.push(key, payload).map_err(to_python),
+            State::Adding(sorter) => {
+                if sorter.would_spill(key.len() + payload.len()) {
+                    let mut raised = None;
+                    let waited = sorter.wait_or_stop(&mut || interrupted(&mut raised));
+                    waited.map_err(|error| raised_or(&mut raised, error))?;
+                }
+                sorter.push(key, payload).map_err(to_python)
+            }
             State::Reading(..) | State::Read => Err(added_after_read_error()),
+            State::Stopped => Err(stopped_error()),
             State::Closed => Err(closed_error()),
         };
         match self.state.try_lock() {
@@ -430,7 +493,12 @@ impl PySorter {
             match mem::replace(&mut *state, State::Read) {
                 State::Adding(sorter) => {
                     self.status.store(READ, Ordering::Release);
-                    let merged = sorter.finish().map_err(to_python)?;
+                    let mut raised = None;
+                    let finished = sorter.finish_or_stop(&mut || interrupted(&mut raised));
+                    let merged = finished.map_err(|error| {
+                        *state = State::Stopped;
+                        raised_or(&mut raised, error)
+                    })?;
                     if iterate {
                         *state = State::Reading(merged, Batch::default());
                         Ok(None)
@@ -441,6 +509,10 @@ impl PySorter {
                 State::Closed => {
                     *state = State::Closed;
                     Err(closed_error())
+                }
+                State::Stopped => {
+                    *state = State::Stopped;
+                    Err(stopped_error())
                 }
                 other => {
                     *state = other;
@@ -462,7 +534,7 @@ impl PySorter {
 #[pymethods]
 impl PySorter {
     #[new]
-    #[pyo3(signature = (key = None, /, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64))]
+    #[pyo3(signature = (key = None, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64, threads = 1))]
     fn new(
         py: Python<'_>,
         key: Option<Bound<'_, PyAny>>,
@@ -470,6 +542,7 @@ impl PySorter {
         max_bytes: i64,
         tmp_dir: Option<PathBuf>,
         max_open: i64,
+        threads: i64,
     ) -> PyResult<Self> {
         if let Some(function) = &key
             && !function.is_callable()
@@ -497,10 +570,18 @@ impl PySorter {
                 (Encoder::Pickle(dumps), pickle.getattr("loads")?.unbind())
             }
         };
+        let tmp_dir = match tmp_dir {
+            Some(dir) => dir,
+            None => py
+                .import("tempfile")?
+                .call_method0("gettempdir")?
+                .extract::<PathBuf>()?,
+        };
         let config = Config {
             max_bytes: setting("max_bytes", max_bytes, MIN_MAX_BYTES)?,
-            tmp_dir,
+            tmp_dir: Some(tmp_dir),
             max_open: setting("max_open", max_open, MIN_MAX_OPEN)?,
+            threads: setting("threads", threads, 1)?,
         };
         let sorter = CoreSorter::new(config).map_err(to_python)?;
         Ok(PySorter {
@@ -520,44 +601,17 @@ impl PySorter {
     ///     ValueError: If the sorter is closed.
     ///     RuntimeError: If the sorter has been read, or an earlier error lost items.
     ///     OSError: If spilling to disk fails.
+    #[pyo3(signature = (item, /))]
     fn add(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<()> {
         self.check_adding()?;
         self.push_item(py, item, &mut Vec::with_capacity(64))
     }
 
-    /// Add every item, keyed and encoded now; items before one that fails stay added.
-    fn extend(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_adding()?;
-        let mut key = Vec::with_capacity(64);
-        for item in items.try_iter()? {
-            self.push_item(py, &item?, &mut key)?;
-        }
-        Ok(())
-    }
-
     /// Add bytes that the codec would decode, with their sort key, calling neither.
+    #[pyo3(signature = (key, payload, /))]
     fn add_encoded(&self, py: Python<'_>, key: &Bound<'_, PyAny>, payload: &[u8]) -> PyResult<()> {
         self.check_adding()?;
         self.push_encoded(py, key, payload, &mut Vec::with_capacity(64))
-    }
-
-    /// Add every `(key, payload)` pair, calling neither the key function nor the codec.
-    fn extend_encoded(&self, py: Python<'_>, pairs: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_adding()?;
-        let mut buffer = Vec::with_capacity(64);
-        for pair in pairs.try_iter()? {
-            let pair = pair?;
-            let (key, payload) = pair
-                .extract::<(Bound<'_, PyAny>, Bound<'_, PyBytes>)>()
-                .map_err(|_| {
-                    PyTypeError::new_err(format!(
-                        "extend_encoded takes (key, bytes) tuples, not {}",
-                        type_name(&pair)
-                    ))
-                })?;
-            self.push_encoded(py, &key, payload.as_bytes(), &mut buffer)?;
-        }
-        Ok(())
     }
 
     /// The number of items added.
@@ -565,13 +619,26 @@ impl PySorter {
         self.added.load(Ordering::Relaxed) as usize
     }
 
-    /// Return the items, decoded, in sorted order; a sorter can be read only once.
+    /// Add every item given, then return every item added, decoded, in sorted order.
+    ///
+    /// Items are keyed and encoded as they are added. A sorter can be sorted only once; items
+    /// given before one that fails stay added, and the sorter is not sorted. Once the iterator
+    /// raises, as when decoding an item fails, it ends, as a generator does.
     ///
     /// Raises:
+    ///     TypeError: If a key is not a sort key, or the codec does not return bytes.
     ///     ValueError: If the sorter is closed; also raised by the iterator once it is.
-    ///     RuntimeError: If the sorter has been read, or an earlier error lost items.
-    ///     OSError: If reading what was spilled fails.
-    fn __iter__(&self, py: Python<'_>) -> PyResult<SortedIterator> {
+    ///     RuntimeError: If the sorter has been sorted, or an earlier error lost items.
+    ///     OSError: If spilling, or reading what was spilled, fails.
+    #[pyo3(signature = (items = None, /))]
+    fn sort(&self, py: Python<'_>, items: Option<&Bound<'_, PyAny>>) -> PyResult<SortedIterator> {
+        if let Some(items) = items {
+            self.check_adding()?;
+            let mut key = Vec::with_capacity(64);
+            for item in items.try_iter()? {
+                self.push_item(py, &item?, &mut key)?;
+            }
+        }
         self.iterator(py, Some(self.decode.clone_ref(py)))
     }
 
@@ -616,12 +683,14 @@ impl PySorter {
                 let waiting = receiver
                     .take()
                     .expect("the receiver is put back after each message");
-                let (message, waiting) = py.detach(move || (waiting.recv(), waiting));
+                let (message, waiting) = py.detach(move || (waiting.recv_timeout(POLL), waiting));
                 receiver = Some(waiting);
-                let Ok(message) = message else {
-                    return Ok(());
-                };
-                write_all(&write, &message.map_err(to_python)?)?;
+                match message {
+                    Ok(message) => write_all(&write, &message.map_err(to_python)?)?,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+                py.check_signals()?;
             }
         })();
         drop(receiver);
@@ -631,6 +700,9 @@ impl PySorter {
     }
 
     /// Drop every item and remove what was spilled; closing again does nothing.
+    ///
+    /// A `write_to` already running in another thread is not stopped: it writes every item, then
+    /// removes what was spilled.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.status.store(CLOSED, Ordering::Release);
         py.detach(|| {
@@ -659,6 +731,25 @@ impl PySorter {
     }
 }
 
+impl Drop for PySorter {
+    fn drop(&mut self) {
+        release(&mut self.state);
+    }
+}
+
+/// Drops a sorter's state once nothing else shares it, without the GIL if it is attached, since
+/// waiting for a spill and removing what was spilled can take a while.
+fn release(state: &mut Arc<Lock<State>>) {
+    let Some(lock) = Arc::get_mut(state) else {
+        return;
+    };
+    let inner = lock.mutex.get_mut().unwrap_or_else(PoisonError::into_inner);
+    let state = mem::replace(inner, State::Closed);
+    if matches!(state, State::Adding(_) | State::Reading(..)) {
+        Python::try_attach(|py| py.detach(move || drop(state)));
+    }
+}
+
 /// Writes all of `data` to a handle, again after a short write.
 fn write_all(write: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<()> {
     let mut rest = data;
@@ -674,7 +765,7 @@ fn write_all(write: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<()> {
 }
 
 /// The items of a sorter, merged in order as they are read.
-#[pyclass(module = "spillsort", frozen, generic)]
+#[pyclass(module = "spillsort", name = "_SortedIterator", frozen)]
 struct SortedIterator {
     state: Arc<Lock<State>>,
     decode: Option<Py<PyAny>>,
@@ -686,28 +777,53 @@ impl SortedIterator {
         slf
     }
 
+    /// Returns the next item, merging the next batch first if this one is drained and no signal
+    /// handler raises, which would end reading, as an error decoding the item does.
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let value = match self.state.try_lock() {
             Some(mut guard) => {
                 let state = &mut *guard;
                 if state.needs_refill() {
+                    if let Err(error) = py.check_signals() {
+                        py.detach(|| state.end());
+                        return Err(error);
+                    }
                     py.detach(|| state.refill_if_drained())?;
                 }
                 state.next_value()?.map(|value| PyBytes::new(py, value))
             }
-            None => py
-                .detach(|| -> PyResult<Option<Vec<u8>>> {
+            None => {
+                let mut raised = None;
+                let value = py.detach(|| -> PyResult<Option<Vec<u8>>> {
                     let mut state = self.state.lock()?;
+                    if state.needs_refill() && interrupted(&mut raised) {
+                        state.end();
+                        return Ok(None);
+                    }
                     state.refill_if_drained()?;
                     Ok(state.next_value()?.map(<[u8]>::to_vec))
-                })?
-                .map(|value| PyBytes::new(py, &value)),
+                })?;
+                if let Some(error) = raised {
+                    return Err(error);
+                }
+                value.map(|value| PyBytes::new(py, &value))
+            }
         };
         let Some(value) = value else {
             return Ok(None);
         };
         match &self.decode {
-            Some(decode) => Ok(Some(decode.bind(py).call1((value,))?.unbind())),
+            Some(decode) => match decode.bind(py).call1((value,)) {
+                Ok(item) => Ok(Some(item.unbind())),
+                Err(error) => {
+                    py.detach(|| {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.end();
+                        }
+                    });
+                    Err(error)
+                }
+            },
             None => Ok(Some(value.into_any().unbind())),
         }
     }
@@ -721,9 +837,14 @@ impl SortedIterator {
     }
 }
 
+impl Drop for SortedIterator {
+    fn drop(&mut self) {
+        release(&mut self.state);
+    }
+}
+
 #[pymodule(gil_used = false)]
 fn _spillsort(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySorter>()?;
-    m.add_class::<SortedIterator>()?;
     Ok(())
 }

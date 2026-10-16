@@ -81,12 +81,13 @@ def run(method: str, count: int, max_bytes: int, directory: Path) -> None:
                 handle.writelines(line for _, line in sorted(lines(count), key=by_key))
         case [_, "items"]:
             sorter = engine(by_position, max_bytes=max_bytes, tmp_dir=directory)
-            sorter.extend(items(count))
-            for _ in sorter:
+            for _ in sorter.sort(items(count)):
                 pass
         case [_, "lines"]:
             sorter = engine(max_bytes=max_bytes, tmp_dir=directory)
-            sorter.extend_encoded(lines(count))
+            add = sorter.add_encoded
+            for key, line in lines(count):
+                add(key, line)
             with out.open("wb") as handle:
                 sorter.write_to(handle)
         case _:
