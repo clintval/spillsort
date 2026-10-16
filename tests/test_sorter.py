@@ -1,0 +1,389 @@
+"""A sorter returns what was added in sorted, stable order, and leaves no files behind."""
+
+import gc
+import io
+import pickle
+import shutil
+from collections.abc import Callable
+from collections.abc import Iterator
+from dataclasses import dataclass
+from operator import itemgetter
+from pathlib import Path
+from typing import cast
+
+import pytest
+from hypothesis import HealthCheck
+from hypothesis import given
+from hypothesis import settings
+from hypothesis import strategies as st
+from spillsort import Codec
+from spillsort import Sorter
+from spillsort import SortKey
+
+from tests.helpers import python_sorted
+from tests.helpers import spilled
+
+
+@dataclass(frozen=True)
+class Feature:
+    refname: str
+    start: int
+    end: int
+
+
+def features(count: int) -> list[Feature]:
+    return [Feature(f"chr{index % 3}", (index * 7919) % 1000, index) for index in range(count)]
+
+
+def by_position(feature: Feature) -> SortKey:
+    return (feature.refname, feature.start)
+
+
+@settings(
+    max_examples=100, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+@given(
+    st.lists(st.tuples(st.integers(0, 5), st.integers()), max_size=300),
+    st.integers(2, 4_000),
+    st.integers(2, 4),
+)
+def test_items_come_out_sorted_and_stable_whatever_the_memory(
+    tmp_path: Path, items: list[tuple[int, int]], max_bytes: int, max_open: int
+) -> None:
+    sorter = Sorter(itemgetter(0), max_bytes=max_bytes, max_open=max_open, tmp_dir=tmp_path)
+    sorter.extend(items)
+    assert len(sorter) == len(items)
+    assert list(sorter) == python_sorted(items, key=itemgetter(0))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_many_more_runs_than_can_be_open_are_merged_in_passes(tmp_path: Path) -> None:
+    items = features(5_000)
+    with Sorter(by_position, max_bytes=512, max_open=2, tmp_dir=tmp_path) as sorter:
+        sorter.extend(items)
+        assert len(spilled(tmp_path)) > 100
+        assert list(sorter) == python_sorted(items, key=by_position)
+        assert list(tmp_path.iterdir()) == []
+
+
+def test_items_that_fit_in_memory_are_never_spilled(tmp_path: Path) -> None:
+    sorter = Sorter(by_position, tmp_dir=tmp_path)
+    sorter.extend(features(1_000))
+    assert list(tmp_path.iterdir()) == []
+    assert list(sorter) == python_sorted(features(1_000), key=by_position)
+
+
+def test_an_empty_sorter_reads_nothing() -> None:
+    assert list(Sorter[int]()) == []
+    assert list(Sorter[int]().encoded()) == []
+    out = io.BytesIO()
+    Sorter[int]().write_to(out)
+    assert out.getvalue() == b""
+
+
+class CountingCodec:
+    def __init__(self) -> None:
+        self.encoded: int = 0
+        self.decoded: int = 0
+
+    def encode(self, item: Feature, /) -> bytes:
+        self.encoded += 1
+        return f"{item.refname}\t{item.start}\t{item.end}".encode()
+
+    def decode(self, data: bytes, /) -> Feature:
+        self.decoded += 1
+        refname, start, end = data.decode().split("\t")
+        return Feature(refname, int(start), int(end))
+
+
+def test_a_codec_encodes_and_decodes_each_item_once(tmp_path: Path) -> None:
+    codec = CountingCodec()
+    items = features(500)
+    sorter = Sorter(by_position, codec=codec, max_bytes=256, tmp_dir=tmp_path)
+    sorter.extend(items)
+    assert (codec.encoded, codec.decoded) == (500, 0)
+    assert list(sorter) == python_sorted(items, key=by_position)
+    assert (codec.encoded, codec.decoded) == (500, 500)
+
+
+def test_items_are_pickled_without_a_codec() -> None:
+    sorter = Sorter(by_position, max_bytes=256)
+    sorter.extend(features(300))
+    values = list(sorter.encoded())
+    assert [pickle.loads(value) for value in values] == python_sorted(
+        features(300), key=by_position
+    )
+
+
+def test_encoded_items_skip_the_key_function_and_the_codec(tmp_path: Path) -> None:
+    def refuse(_: object) -> bytes:
+        raise AssertionError("called")
+
+    codec = cast(
+        "Codec[bytes]", cast(object, type("Refusing", (), {"encode": refuse, "decode": refuse})())
+    )
+    lines = [(("chr2", 5), b"chr2\t5\t9\n"), (("chr1", 7), b"chr1\t7\t8\n"), (("chr1", 2), b"")]
+    sorter = Sorter(
+        cast("Callable[[bytes], SortKey]", refuse), codec=codec, max_bytes=32, tmp_dir=tmp_path
+    )
+    sorter.add_encoded(*lines[0])
+    sorter.extend_encoded(iter(lines[1:]))
+    out = io.BytesIO()
+    sorter.write_to(out)
+    assert out.getvalue() == b"chr1\t7\t8\nchr2\t5\t9\n"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "pair", [[1, b"payload"], (1, "payload"), (1,), 1], ids=["list", "str", "short", "int"]
+)
+def test_encoded_pairs_must_be_tuples_of_a_key_and_bytes(pair: object) -> None:
+    sorter: Sorter[int] = Sorter()
+    pairs = cast("list[tuple[SortKey, bytes]]", [(2, b"two"), pair, (1, b"one")])
+    with pytest.raises(TypeError, match=r"extend_encoded takes \(key, bytes\) tuples"):
+        sorter.extend_encoded(pairs)
+    assert list(sorter.encoded()) == [b"two"]
+
+
+def test_a_failing_key_or_codec_keeps_the_items_before_it() -> None:
+    def key(item: int) -> SortKey:
+        if item == 3:
+            raise KeyError(item)
+        return -item
+
+    sorter = Sorter(key)
+    with pytest.raises(KeyError):
+        sorter.extend(range(10))
+    assert len(sorter) == 3
+
+    class Text:
+        def encode(self, item: int, /) -> str:
+            return str(item)
+
+        def decode(self, data: bytes, /) -> int:
+            return int(data)
+
+    wrong = Sorter(codec=cast("Codec[int]", cast(object, Text())))
+    with pytest.raises(TypeError, match="a codec must encode an item into bytes, not str"):
+        wrong.add(1)
+    assert list(sorter) == [2, 1, 0]
+
+
+class Partial:
+    """A raw handle that writes at most a few bytes at a time."""
+
+    def __init__(self, most: int) -> None:
+        self.most: int = most
+        self.written: bytearray = bytearray()
+
+    def write(self, data: bytes, /) -> int:
+        self.written += data[: self.most]
+        return min(len(data), self.most)
+
+
+def test_writing_writes_everything_even_to_a_handle_that_writes_part(tmp_path: Path) -> None:
+    payloads = [bytes([index % 251]) * (index % 2_000) for index in range(3_000)]
+    sorter: Sorter[bytes] = Sorter(max_bytes=1 << 16, tmp_dir=tmp_path)
+    sorter.extend_encoded(
+        ((len(payload), -index), payload) for index, payload in enumerate(payloads)
+    )
+    handle = Partial(most=100_000)
+    sorter.write_to(handle)
+    expected = sorted(enumerate(payloads), key=lambda pair: (len(pair[1]), -pair[0]))
+    assert bytes(handle.written) == b"".join(payload for _, payload in expected)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_writing_to_a_handle_that_fails_raises_and_removes_spilled_files(tmp_path: Path) -> None:
+    class Failing:
+        def write(self, _data: bytes, /) -> int:
+            raise OSError("disk full")
+
+    class Stuck:
+        def write(self, _data: bytes, /) -> int:
+            return 0
+
+    for handle, message in ((Failing(), "disk full"), (Stuck(), "wrote no bytes")):
+        sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
+        sorter.extend(range(1_000))
+        with pytest.raises(OSError, match=message):
+            sorter.write_to(handle)
+        assert list(tmp_path.iterdir()) == []
+
+
+def test_writing_to_something_without_write_leaves_the_sorter_unread() -> None:
+    sorter: Sorter[int] = Sorter()
+    sorter.add(1)
+    with pytest.raises(AttributeError):
+        sorter.write_to(cast("io.BytesIO", object()))
+    assert list(sorter) == [1]
+
+
+def test_a_sorter_is_read_once() -> None:
+    readers: list[Callable[[Sorter[int]], object]] = [
+        list,
+        lambda sorter: list(sorter.encoded()),
+        lambda sorter: sorter.write_to(io.BytesIO()),
+    ]
+    for first in readers:
+        for second in readers:
+            sorter: Sorter[int] = Sorter()
+            sorter.add(1)
+            first(sorter)
+            with pytest.raises(RuntimeError, match="read only once"):
+                second(sorter)
+            with pytest.raises(RuntimeError, match="once it has been read"):
+                sorter.add(2)
+            with pytest.raises(RuntimeError, match="once it has been read"):
+                sorter.extend_encoded([(2, b"")])
+            assert len(sorter) == 1
+
+
+def test_a_closed_sorter_refuses_everything(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
+    sorter.extend(range(100))
+    sorter.close()
+    sorter.close()
+    assert list(tmp_path.iterdir()) == []
+    assert len(sorter) == 100
+    actions: list[Callable[[], object]] = [
+        lambda: sorter.add(1),
+        lambda: sorter.extend([1]),
+        lambda: sorter.add_encoded(1, b""),
+        lambda: sorter.extend_encoded([(1, b"")]),
+        lambda: iter(sorter),
+        sorter.encoded,
+        lambda: sorter.write_to(io.BytesIO()),
+    ]
+    for action in actions:
+        with pytest.raises(ValueError, match="closed sorter"):
+            action()
+
+
+def test_spilled_files_are_removed_however_reading_ends(tmp_path: Path) -> None:
+    def filled() -> Sorter[int]:
+        sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
+        sorter.extend(range(1_000, 0, -1))
+        assert spilled(tmp_path)
+        return sorter
+
+    sorter = filled()
+    assert sum(1 for _ in sorter) == 1_000
+    assert list(tmp_path.iterdir()) == []
+
+    with filled() as sorter:
+        iterator = iter(sorter)
+        assert next(iterator) == 1
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(ValueError, match="closed sorter"):
+        next(iterator)
+
+    with pytest.raises(KeyError), filled() as sorter:
+        raise KeyError
+    assert list(tmp_path.iterdir()) == []
+
+    sorter = filled()
+    del sorter
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_iterator_outlives_its_sorter() -> None:
+    def numbers() -> Iterator[int]:
+        sorter: Sorter[int] = Sorter(max_bytes=64)
+        sorter.extend(range(500, 0, -1))
+        return iter(sorter)
+
+    iterator = numbers()
+    gc.collect()
+    assert list(iterator) == list(range(1, 501))
+    assert next(iterator, None) is None
+
+
+def test_a_sorter_in_a_reference_cycle_is_collected(tmp_path: Path) -> None:
+    def fill() -> None:
+        sorter: Sorter[int]
+
+        def key(item: int) -> SortKey:
+            return item + 0 * len(sorter)
+
+        sorter = Sorter(key, max_bytes=64, tmp_dir=tmp_path)
+        sorter.extend(range(1_000))
+
+    fill()
+    assert spilled(tmp_path)
+    gc.collect()
+    assert list(tmp_path.iterdir()) == []
+
+
+def wait_for_runs(sorter: Sorter[int], tmp_path: Path, count: int) -> None:
+    """Add items until `count` runs exist, so that every run before the last is complete."""
+    value = 0
+    while len(spilled(tmp_path)) < count:
+        sorter.add(value)
+        value += 1
+
+
+def test_a_failed_spill_refuses_to_go_on(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
+    wait_for_runs(sorter, tmp_path, 2)
+    (directory,) = tmp_path.iterdir()
+    while directory.exists():
+        shutil.rmtree(directory, ignore_errors=True)
+    with pytest.raises(FileNotFoundError):
+        for value in range(1_000):
+            sorter.add(value)
+    with pytest.raises(RuntimeError, match="an earlier error lost records"):
+        sorter.add(0)
+    with pytest.raises(RuntimeError, match="an earlier error lost records"):
+        list(sorter)
+
+
+def test_a_run_that_is_cut_short_is_an_error_when_read(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=256, tmp_dir=tmp_path)
+    wait_for_runs(sorter, tmp_path, 3)
+    first = spilled(tmp_path)[0]
+    first.write_bytes(first.read_bytes()[:-1])
+    iterator = iter(sorter)
+    with pytest.raises(OSError, match="ended before its last record"):
+        list(iterator)
+    assert list(tmp_path.iterdir()) == []
+    assert next(iterator, None) is None
+
+
+def test_a_missing_run_is_an_error_when_read(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
+    wait_for_runs(sorter, tmp_path, 3)
+    spilled(tmp_path)[0].unlink()
+    with pytest.raises(FileNotFoundError, match="run-000000"):
+        iter(sorter)
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(RuntimeError, match="read only once"):
+        iter(sorter)
+
+
+def test_settings_are_checked(tmp_path: Path) -> None:
+    for max_bytes in (1, 0, -5):
+        with pytest.raises(ValueError, match=f"max_bytes must be at least 2, not {max_bytes}"):
+            Sorter(max_bytes=max_bytes)
+    with pytest.raises(ValueError, match="max_open must be at least 2, not 1"):
+        Sorter(max_open=1)
+    with pytest.raises(TypeError, match="key must be a function returning a sort key, not int"):
+        Sorter(cast("Callable[[int], SortKey]", 3))
+    with pytest.raises(TypeError, match="a codec must have encode and decode methods"):
+        Sorter(codec=cast("Codec[int]", object()))
+    with pytest.raises(FileNotFoundError, match="missing"):
+        Sorter(tmp_dir=tmp_path / "missing")
+    (tmp_path / "file").touch()
+    with pytest.raises(NotADirectoryError, match="is not a directory"):
+        Sorter(tmp_dir=str(tmp_path / "file"))
+
+
+def test_a_sorter_can_be_subscripted_but_not_pickled() -> None:
+    sorter = Sorter[int]()
+    assert type(sorter) is Sorter
+    assert repr(Sorter[int]) == "spillsort.Sorter[int]"
+    with pytest.raises(TypeError, match="pickle"):
+        pickle.dumps(sorter)
+    with pytest.raises(TypeError):
+        sorter.extend(cast("list[int]", cast(object, 3)))
