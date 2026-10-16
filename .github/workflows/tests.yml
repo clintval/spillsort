@@ -53,6 +53,29 @@ jobs:
       - name: Check that the crate packages
         run: cargo package --locked
 
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # to check out the repository
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain named by rust-version in Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          rustup toolchain install "$msrv" --profile minimal
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the crate builds with that toolchain
+        env:
+          TOOLCHAIN: ${{ steps.msrv.outputs.toolchain }}
+        run: cargo +"$TOOLCHAIN" check --all-features --locked
+
   lint:
     name: lint
     runs-on: ubuntu-latest
