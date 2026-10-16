@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from operator import itemgetter
 from pathlib import Path
+from typing import Any
 from typing import TypeVar
 from typing import cast
 
@@ -390,7 +391,7 @@ def test_a_missing_run_is_an_error_when_read(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="run-000000"):
         sorter.sort()
     assert list(tmp_path.iterdir()) == []
-    with pytest.raises(RuntimeError, match="read only once"):
+    with pytest.raises(RuntimeError, match="stopped"):
         sorter.sort()
 
 
@@ -474,3 +475,19 @@ def test_spilled_files_go_where_python_puts_temporary_files(
     assert spilled(tmp_path)
     assert list(sorter.sort()) == list(range(1_000))
     assert list(tmp_path.iterdir()) == []
+
+
+def test_threads_are_checked_before_the_tmp_dir(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="threads must be at least 1"):
+        _ = Sorter[int](threads=0, tmp_dir=tmp_path / "missing")
+
+
+def test_adding_takes_its_arguments_by_position() -> None:
+    sorter: Sorter[int] = Sorter()
+    add: Any = sorter.add
+    add_encoded: Any = sorter.add_encoded
+    with pytest.raises(TypeError):
+        add(item=1)
+    with pytest.raises(TypeError):
+        add_encoded(key=1, payload=b"")
+    assert len(sorter) == 0

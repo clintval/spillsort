@@ -53,6 +53,10 @@ fn added_after_read_error() -> PyErr {
     PyRuntimeError::new_err("cannot add to a sorter once it has been read")
 }
 
+fn stopped_error() -> PyErr {
+    PyRuntimeError::new_err("the sorter stopped when reading it failed or was interrupted")
+}
+
 fn check_signals(py: Python<'_>) -> PyResult<()> {
     py.check_signals()
 }
@@ -187,6 +191,7 @@ enum State {
     Adding(CoreSorter),
     Reading(Merged, Batch),
     Read,
+    Stopped,
     Closed,
 }
 
@@ -199,7 +204,9 @@ impl State {
             return Ok(());
         }
         let filled = batch.fill(merged);
-        if filled.is_err() || batch.is_drained() {
+        if filled.is_err() {
+            *self = State::Stopped;
+        } else if batch.is_drained() {
             *self = State::Read;
         }
         filled.map_err(to_python)
@@ -209,17 +216,18 @@ impl State {
         matches!(self, State::Reading(_, batch) if batch.is_drained())
     }
 
-    /// Ends reading, dropping the merge, which removes what was spilled.
+    /// Stops reading after an error or a signal, dropping the merge, which removes what was
+    /// spilled.
     fn end(&mut self) {
         if matches!(self, State::Reading(..)) {
-            *self = State::Read;
+            *self = State::Stopped;
         }
     }
 
     fn next_value(&mut self) -> PyResult<Option<&[u8]>> {
         match self {
             State::Reading(_, batch) => Ok(batch.take()),
-            State::Adding(_) | State::Read => Ok(None),
+            State::Adding(_) | State::Read | State::Stopped => Ok(None),
             State::Closed => Err(closed_error()),
         }
     }
@@ -366,7 +374,8 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
 /// must not be shared across a fork: make a new one in the child.
 ///
 /// Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
-/// reading; an interrupted merge or read ends the sort and removes what was spilled.
+/// reading; an interrupted merge or read ends the sort and removes what was spilled, which can take
+/// a moment when much was spilled, and the sorter then refuses to be read again.
 ///
 /// Args:
 ///     key: A function returning the sort key of an item: an int, float, str, bytes, None, or a
@@ -402,7 +411,10 @@ impl PySorter {
         match self.status.load(Ordering::Acquire) {
             ADDING => Ok(()),
             CLOSED => Err(closed_error()),
-            _ => Err(added_after_read_error()),
+            _ => match self.state.try_lock() {
+                Some(state) if matches!(*state, State::Stopped) => Err(stopped_error()),
+                _ => Err(added_after_read_error()),
+            },
         }
     }
 
@@ -419,6 +431,7 @@ impl PySorter {
                 sorter.push(key, payload).map_err(to_python)
             }
             State::Reading(..) | State::Read => Err(added_after_read_error()),
+            State::Stopped => Err(stopped_error()),
             State::Closed => Err(closed_error()),
         };
         match self.state.try_lock() {
@@ -482,7 +495,10 @@ impl PySorter {
                     self.status.store(READ, Ordering::Release);
                     let mut raised = None;
                     let finished = sorter.finish_or_stop(&mut || interrupted(&mut raised));
-                    let merged = finished.map_err(|error| raised_or(&mut raised, error))?;
+                    let merged = finished.map_err(|error| {
+                        *state = State::Stopped;
+                        raised_or(&mut raised, error)
+                    })?;
                     if iterate {
                         *state = State::Reading(merged, Batch::default());
                         Ok(None)
@@ -493,6 +509,10 @@ impl PySorter {
                 State::Closed => {
                     *state = State::Closed;
                     Err(closed_error())
+                }
+                State::Stopped => {
+                    *state = State::Stopped;
+                    Err(stopped_error())
                 }
                 other => {
                     *state = other;
@@ -581,12 +601,14 @@ impl PySorter {
     ///     ValueError: If the sorter is closed.
     ///     RuntimeError: If the sorter has been read, or an earlier error lost items.
     ///     OSError: If spilling to disk fails.
+    #[pyo3(signature = (item, /))]
     fn add(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<()> {
         self.check_adding()?;
         self.push_item(py, item, &mut Vec::with_capacity(64))
     }
 
     /// Add bytes that the codec would decode, with their sort key, calling neither.
+    #[pyo3(signature = (key, payload, /))]
     fn add_encoded(&self, py: Python<'_>, key: &Bound<'_, PyAny>, payload: &[u8]) -> PyResult<()> {
         self.check_adding()?;
         self.push_encoded(py, key, payload, &mut Vec::with_capacity(64))

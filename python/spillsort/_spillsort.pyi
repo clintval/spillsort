@@ -39,7 +39,8 @@ class Sorter(Generic[_T]):
     must not be shared across a fork: make a new one in the child.
 
     Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
-    reading; an interrupted merge or read ends the sort and removes what was spilled.
+    reading; an interrupted merge or read ends the sort and removes what was spilled, which can take
+    a moment when much was spilled, and the sorter then refuses to be read again.
 
     Args:
         key: A function returning the sort key of an item: an int, float, str, bytes, None, or a

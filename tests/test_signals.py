@@ -44,8 +44,10 @@ def test_a_signal_stops_merging_and_removes_what_was_spilled(tmp_path: Path) -> 
     with interrupted_after(0.01), pytest.raises(InterruptionError):
         sorter.sort()
     assert list(tmp_path.iterdir()) == []
-    with pytest.raises(RuntimeError, match="read only once"):
+    with pytest.raises(RuntimeError, match="stopped"):
         sorter.sort()
+    with pytest.raises(RuntimeError, match="stopped"):
+        sorter.add_encoded(0, b"")
 
 
 def test_a_signal_stops_reading_and_ends_it(tmp_path: Path) -> None:
