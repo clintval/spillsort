@@ -30,7 +30,9 @@ class Sorter(Generic[_T]):
     most `max_bytes` of memory, unless one item alone needs more. Once half of that is full, a
     background thread sorts it and writes it to a private directory in `tmp_dir` while the other
     half fills. Sorting merges what was written with what is held, so items come out in key order,
-    and items with equal keys come out in the order they were added.
+    and items with equal keys come out in the order they were added. A merge reads at most
+    `max_open` runs at once, each through a 256 KiB buffer and holding its next item, so it
+    takes about `max_open` times the largest item, plus those buffers, besides what is held.
 
     The private directory is removed when reading ends, on `close()`, when a `with` block exits,
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
@@ -42,11 +44,14 @@ class Sorter(Generic[_T]):
     Args:
         key: A function returning the sort key of an item: an int, float, str, bytes, None, or a
             tuple or list of them, compared as Python compares them. None sorts items by
-            themselves.
+            themselves. NumPy integers, like anything with `__index__`, are ints, and
+            `np.float64`, `np.str_` and `np.bytes_` are a float, a str and bytes; other NumPy
+            scalars, such as `np.float32` and `np.bool_`, raise TypeError, so convert them first.
         codec: Encodes each item into bytes and decodes it back; pickle if None.
         max_bytes: The most memory to hold keys and encoded items in, counting 16 bytes more for
             each, at least 2.
-        tmp_dir: The directory to spill into, or None for `tempfile.gettempdir()`.
+        tmp_dir: The directory to spill into, which must be writable, or None for
+            `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
         threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
             a pool of this sorter's own.
@@ -122,7 +127,11 @@ class Sorter(Generic[_T]):
         """
 
     def close(self) -> None:
-        """Drop every item and remove what was spilled; closing again does nothing."""
+        """Drop every item and remove what was spilled; closing again does nothing.
+
+        A `write_to` already running in another thread is not stopped: it writes every item, then
+        removes what was spilled.
+        """
 
     def __enter__(self) -> Self: ...
     def __exit__(

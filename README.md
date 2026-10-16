@@ -46,11 +46,11 @@ Add items one at a time as they arrive, bound the memory with `max_bytes`, sort 
 
 ```python
 import random
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory
 
 numbers = [random.random() for _ in range(100_000)]
 
-with Sorter(max_bytes=2**20, threads=4, tmp_dir=mkdtemp()) as sorter:
+with TemporaryDirectory() as tmp_dir, Sorter(max_bytes=2**20, threads=4, tmp_dir=tmp_dir) as sorter:
     for number in numbers:
         sorter.add(number)
     ordered = list(sorter.sort())

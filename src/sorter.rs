@@ -239,7 +239,9 @@ pub struct Config {
     /// temporary directory, which is `TMPDIR` on Unix.
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
-    /// into one first, as many times as it takes.
+    /// into one first, as many times as it takes. A merge reads each run through a 256 KiB buffer,
+    /// holding its next record, so it takes about this many times the largest record, plus those
+    /// buffers.
     pub max_open: usize,
     /// The threads that sort each chunk: with 1, the thread that sorts it, and with more, a pool
     /// of this sorter's own.
