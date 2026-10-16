@@ -8,11 +8,17 @@ use std::path::{Path, PathBuf};
 const WRITE_BUFFER: usize = 1 << 20;
 const READ_BUFFER: usize = 256 << 10;
 
-/// A run on disk and the number of records written to it.
+/// A run on disk, and the number of records and bytes written to it.
 #[derive(Clone, Debug)]
 pub(crate) struct Run {
     pub path: PathBuf,
     pub records: u64,
+    pub bytes: u64,
+}
+
+/// The bytes a record takes in a run.
+pub(crate) fn record_bytes(key: &[u8], value: &[u8]) -> u64 {
+    (8 + key.len() + value.len()) as u64
 }
 
 fn with_path(error: &io::Error, path: &Path) -> io::Error {
@@ -24,6 +30,7 @@ pub(crate) struct RunWriter {
     out: BufWriter<File>,
     path: PathBuf,
     records: u64,
+    bytes: u64,
 }
 
 impl RunWriter {
@@ -37,6 +44,7 @@ impl RunWriter {
             out: BufWriter::with_capacity(WRITE_BUFFER, file),
             path,
             records: 0,
+            bytes: 0,
         })
     }
 
@@ -49,13 +57,23 @@ impl RunWriter {
             self.out.write_all(value)
         })();
         self.records += 1;
+        self.bytes += record_bytes(key, value);
         written.map_err(|error| with_path(&error, &self.path))
     }
 
     pub fn finish(self) -> io::Result<Run> {
-        let RunWriter { out, path, records } = self;
+        let RunWriter {
+            out,
+            path,
+            records,
+            bytes,
+        } = self;
         match out.into_inner() {
-            Ok(_) => Ok(Run { path, records }),
+            Ok(_) => Ok(Run {
+                path,
+                records,
+                bytes,
+            }),
             Err(error) => Err(with_path(&error.into_error(), &path)),
         }
     }
@@ -154,6 +172,7 @@ mod tests {
         let records: [(&[u8], &[u8]); 3] = [(b"", b""), (b"a", b""), (b"\0\0", b"value")];
         let run = write(dir.path().join("run"), &records);
         assert_eq!(run.records, 3);
+        assert_eq!(run.bytes, fs::metadata(&run.path).unwrap().len());
         let expected: Vec<_> = records
             .iter()
             .map(|(key, value)| (key.to_vec(), value.to_vec()))
@@ -196,6 +215,7 @@ mod tests {
         let run = Run {
             path: dir.path().join("missing"),
             records: 1,
+            bytes: 10,
         };
         let error = read(&run).map(|_| ()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);

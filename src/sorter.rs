@@ -15,7 +15,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
 use crate::merge::{Merged, Source};
-use crate::run::{Run, RunReader, RunWriter};
+use crate::run::{Run, RunReader, RunWriter, record_bytes};
 use crate::{Error, Result};
 
 /// The default for [`Config::max_bytes`]: 256 MiB.
@@ -106,6 +106,16 @@ impl Chunk {
         }
     }
 
+    /// The bytes this chunk takes once written as a run.
+    fn run_bytes(&self) -> u64 {
+        (0..self.len())
+            .map(|index| {
+                let (key, value) = self.record(index);
+                record_bytes(key, value)
+            })
+            .sum()
+    }
+
     fn write_run(&self, path: PathBuf) -> io::Result<Run> {
         let mut run = RunWriter::create(path)?;
         for index in 0..self.len() {
@@ -139,7 +149,8 @@ pub struct Config {
     /// The directory in which a private directory of runs is made, or None for the system's
     /// temporary directory, which is `TMPDIR` on Unix.
     pub tmp_dir: Option<PathBuf>,
-    /// The most runs to merge at once. Beyond that, neighboring runs are merged in passes first.
+    /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
+    /// into one first, as many times as it takes.
     pub max_open: usize,
     /// The threads that sort each chunk: with 1, the thread that sorts it, and with more, a pool
     /// of this sorter's own.
@@ -360,6 +371,7 @@ impl Sorter {
         self.runs.push(Run {
             path: path.clone(),
             records: chunk.len() as u64,
+            bytes: chunk.run_bytes(),
         });
         let pool = self.pool.clone();
         let handle = thread::Builder::new()
@@ -374,30 +386,34 @@ impl Sorter {
         Ok(())
     }
 
-    /// Merges neighboring runs until no more than `max_open` remain, so equal keys stay stable.
+    /// Merges neighboring runs, so equal keys stay stable, until no more than `max_open` remain,
+    /// each time merging only as many as are too many, and the neighbors with the fewest bytes.
     fn reduce(&mut self) -> Result<()> {
-        while self.runs.len() > self.config.max_open {
-            let runs = mem::take(&mut self.runs);
-            for group in runs.chunks(self.config.max_open) {
-                if let [only] = group {
-                    self.runs.push(only.clone());
-                    continue;
-                }
-                let sources = group
-                    .iter()
-                    .map(|run| RunReader::open(run).map(Source::Run))
-                    .collect::<io::Result<Vec<_>>>()?;
-                let records = group.iter().map(|run| run.records).sum();
-                let mut merged = Merged::new(sources, None, records)?;
-                let mut out = RunWriter::create(self.next_path()?)?;
-                while let Some((key, value)) = merged.next_record()? {
-                    out.push(key, value)?;
-                }
-                drop(merged);
-                self.runs.push(out.finish()?);
-                for run in group {
-                    fs::remove_file(&run.path)?;
-                }
+        let max_open = self.config.max_open;
+        while self.runs.len() > max_open {
+            let count = (self.runs.len() - max_open + 1).min(max_open);
+            let start = self
+                .runs
+                .windows(count)
+                .map(|group| group.iter().map(|run| run.bytes).sum::<u64>())
+                .enumerate()
+                .min_by_key(|&(_, bytes)| bytes)
+                .map_or(0, |(start, _)| start);
+            let group = self.runs[start..start + count].to_vec();
+            let sources = group
+                .iter()
+                .map(|run| RunReader::open(run).map(Source::Run))
+                .collect::<io::Result<Vec<_>>>()?;
+            let records = group.iter().map(|run| run.records).sum();
+            let mut merged = Merged::new(sources, None, records)?;
+            let mut out = RunWriter::create(self.next_path()?)?;
+            while let Some((key, value)) = merged.next_record()? {
+                out.push(key, value)?;
+            }
+            drop(merged);
+            self.runs.splice(start..start + count, [out.finish()?]);
+            for run in &group {
+                fs::remove_file(&run.path)?;
             }
         }
         Ok(())
@@ -488,6 +504,38 @@ mod tests {
         let mut expected = records.clone();
         expected.sort_by_key(|record| record.0);
         assert_eq!(sorted_by_sorter(&records, 64, 3), expected);
+    }
+
+    #[test]
+    fn merges_only_as_many_runs_as_are_too_many_to_open() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(64, 64, root.path())).unwrap();
+        let mut value = 0u32;
+        while sorter.runs() < 65 {
+            sorter.push(&value.to_be_bytes(), b"").unwrap();
+            value += 1;
+        }
+        sorter.wait().unwrap();
+        let records = sorter.runs[0].records;
+        assert!(sorter.runs.iter().all(|run| run.records == records));
+        sorter.reduce().unwrap();
+        assert_eq!(sorter.runs(), 64);
+        assert_eq!(sorter.made, 66);
+        assert_eq!(sorter.runs[0].records, 2 * records);
+        assert!(sorter.runs[1..].iter().all(|run| run.records == records));
+        assert_eq!(
+            entries(
+                &root
+                    .path()
+                    .read_dir()
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path()
+            ),
+            64
+        );
     }
 
     #[test]
