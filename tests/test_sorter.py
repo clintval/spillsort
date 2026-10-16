@@ -300,6 +300,25 @@ def test_spilled_files_are_removed_however_reading_ends(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_decode_error_ends_reading_and_removes_spilled_files(tmp_path: Path) -> None:
+    class Failing:
+        def encode(self, item: int, /) -> bytes:
+            return str(item).encode()
+
+        def decode(self, data: bytes, /) -> int:
+            if data == b"500":
+                raise ValueError("cannot decode 500")
+            return int(data)
+
+    sorter = Sorter(codec=Failing(), max_bytes=256, tmp_dir=tmp_path)
+    iterator = sorter.sort(range(1_000, 0, -1))
+    assert [next(iterator) for _ in range(499)] == list(range(1, 500))
+    with pytest.raises(ValueError, match="cannot decode 500"):
+        next(iterator)
+    assert next(iterator, None) is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_an_iterator_outlives_its_sorter() -> None:
     def numbers() -> Iterator[int]:
         sorter: Sorter[int] = Sorter(max_bytes=64)

@@ -88,7 +88,8 @@ class Sorter(Generic[_T]):
         """Add every item given, then return every item added, decoded, in sorted order.
 
         Items are keyed and encoded as they are added. A sorter can be sorted only once; items
-        given before one that fails stay added, and the sorter is not sorted.
+        given before one that fails stay added, and the sorter is not sorted. Once the iterator
+        raises, as when decoding an item fails, it ends, as a generator does.
 
         Raises:
             TypeError: If a key is not a sort key, or the codec does not return bytes.

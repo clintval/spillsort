@@ -595,7 +595,8 @@ impl PySorter {
     /// Add every item given, then return every item added, decoded, in sorted order.
     ///
     /// Items are keyed and encoded as they are added. A sorter can be sorted only once; items
-    /// given before one that fails stay added, and the sorter is not sorted.
+    /// given before one that fails stay added, and the sorter is not sorted. Once the iterator
+    /// raises, as when decoding an item fails, it ends, as a generator does.
     ///
     /// Raises:
     ///     TypeError: If a key is not a sort key, or the codec does not return bytes.
@@ -728,7 +729,7 @@ impl SortedIterator {
     }
 
     /// Returns the next item, merging the next batch first if this one is drained and no signal
-    /// handler raises, which would end reading.
+    /// handler raises, which would end reading, as an error decoding the item does.
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let value = match self.state.try_lock() {
             Some(mut guard) => {
@@ -763,7 +764,17 @@ impl SortedIterator {
             return Ok(None);
         };
         match &self.decode {
-            Some(decode) => Ok(Some(decode.bind(py).call1((value,))?.unbind())),
+            Some(decode) => match decode.bind(py).call1((value,)) {
+                Ok(item) => Ok(Some(item.unbind())),
+                Err(error) => {
+                    py.detach(|| {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.end();
+                        }
+                    });
+                    Err(error)
+                }
+            },
             None => Ok(Some(value.into_any().unbind())),
         }
     }
