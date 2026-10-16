@@ -59,15 +59,13 @@ keys: st.SearchStrategy[SortKey] = st.recursive(
 
 def sorted_by_sorter(values: list[SortKey]) -> list[SortKey]:
     sorter: Sorter[SortKey] = Sorter(max_bytes=64)
-    sorter.extend(values)
-    return list(sorter)
+    return list(sorter.sort(values))
 
 
 def order_by_sorter(keys: Sequence[object]) -> list[int]:
     """The positions of `keys` in the order the sorter sorts them."""
     sorter = Sorter(cast("Callable[[int], SortKey]", keys.__getitem__), max_bytes=64)
-    sorter.extend(range(len(keys)))
-    return list(sorter)
+    return list(sorter.sort(range(len(keys))))
 
 
 def comparable(values: list[SortKey]) -> bool:

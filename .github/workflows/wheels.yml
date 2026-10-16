@@ -87,10 +87,10 @@ jobs:
 
           items = [(index * 7919) % 10_000 for index in range(10_000)]
           with spillsort.Sorter(lambda item: -item, max_bytes=4096, tmp_dir=tempfile.mkdtemp()) as sorter:
-              sorter.extend(items)
-              assert list(sorter) == sorted(items, reverse=True)
+              assert list(sorter.sort(items)) == sorted(items, reverse=True)
           with spillsort.Sorter() as sorter:
-              sorter.extend_encoded([(2**80, b"b\n"), (1.5, b"a\n")])
+              sorter.add_encoded(2**80, b"b\n")
+              sorter.add_encoded(1.5, b"a\n")
               out = io.BytesIO()
               sorter.write_to(out)
           assert out.getvalue() == b"a\nb\n"

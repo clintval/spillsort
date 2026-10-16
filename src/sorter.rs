@@ -7,9 +7,11 @@ use std::io;
 use std::mem;
 use std::panic;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use rayon::slice::ParallelSliceMut;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
 use crate::merge::{Merged, Source};
@@ -27,6 +29,9 @@ pub const MIN_MAX_BYTES: usize = 2;
 
 /// The least [`Config::max_open`] may be.
 pub const MIN_MAX_OPEN: usize = 2;
+
+/// The default for [`Config::threads`].
+pub const DEFAULT_THREADS: usize = 1;
 
 /// The bytes each record costs beyond its key and value: where it is and how long its parts are.
 const ENTRY_BYTES: usize = mem::size_of::<Entry>();
@@ -89,11 +94,16 @@ impl Chunk {
         )
     }
 
-    /// Sorts by key on every core, keeping records with equal keys in the order pushed.
-    fn sort(&mut self) {
+    /// Sorts by key, on a pool's threads if given, keeping records with equal keys in the order
+    /// pushed.
+    fn sort(&mut self, pool: Option<&ThreadPool>) {
         let arena = &self.arena;
+        let entries = &mut self.entries;
         let key = |entry: &Entry| &arena[entry.offset..entry.offset + entry.key_len as usize];
-        self.entries.par_sort_by(|a, b| key(a).cmp(key(b)));
+        match pool {
+            Some(pool) => pool.install(|| entries.par_sort_by(|a, b| key(a).cmp(key(b)))),
+            None => entries.sort_by(|a, b| key(a).cmp(key(b))),
+        }
     }
 
     fn write_run(&self, path: PathBuf) -> io::Result<Run> {
@@ -131,6 +141,9 @@ pub struct Config {
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, neighboring runs are merged in passes first.
     pub max_open: usize,
+    /// The threads that sort each chunk: with 1, the thread that sorts it, and with more, a pool
+    /// of this sorter's own.
+    pub threads: usize,
 }
 
 impl Default for Config {
@@ -139,6 +152,7 @@ impl Default for Config {
             max_bytes: DEFAULT_MAX_BYTES,
             tmp_dir: None,
             max_open: DEFAULT_MAX_OPEN,
+            threads: DEFAULT_THREADS,
         }
     }
 }
@@ -164,6 +178,13 @@ impl Config {
         self.max_open = max_open;
         self
     }
+
+    /// Sets [`Config::threads`].
+    #[must_use]
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
 }
 
 /// Sorts records pushed in any order, then [`Sorter::finish`] returns them merged in order.
@@ -174,6 +195,7 @@ impl Config {
 /// [`Error::Failed`].
 pub struct Sorter {
     config: Config,
+    pool: Option<Arc<ThreadPool>>,
     limit: usize,
     chunk: Chunk,
     spare: Option<Chunk>,
@@ -210,8 +232,24 @@ impl Sorter {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, message).into());
             }
         }
+        if config.threads == 0 {
+            return Err(Error::Invalid(
+                "threads must be at least 1, not 0".to_owned(),
+            ));
+        }
+        let pool = if config.threads > 1 {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(config.threads)
+                .thread_name(|index| format!("spillsort-sort-{index}"))
+                .build()
+                .map_err(|error| Error::Io(io::Error::other(error)))?;
+            Some(Arc::new(pool))
+        } else {
+            None
+        };
         Ok(Sorter {
             limit: config.max_bytes / 2,
+            pool,
             config,
             chunk: Chunk::default(),
             spare: None,
@@ -273,7 +311,7 @@ impl Sorter {
         self.spare = None;
         self.reduce()?;
         let mut chunk = mem::take(&mut self.chunk);
-        chunk.sort();
+        chunk.sort(self.pool.as_deref());
         let mut sources = self
             .runs
             .iter()
@@ -322,10 +360,11 @@ impl Sorter {
             path: path.clone(),
             records: chunk.len() as u64,
         });
+        let pool = self.pool.clone();
         let handle = thread::Builder::new()
             .name("spillsort-spill".to_owned())
             .spawn(move || {
-                chunk.sort();
+                chunk.sort(pool.as_deref());
                 chunk.write_run(path)?;
                 chunk.clear();
                 Ok(chunk)

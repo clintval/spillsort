@@ -2,6 +2,7 @@
 
 import faulthandler
 import functools
+import pickle
 import threading
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -72,11 +73,11 @@ def test_threads_adding_to_one_sorter_lose_nothing(tmp_path: Path) -> None:
             if index % 2:
                 sorter.add((number, index))
             else:
-                sorter.extend([(number, index)])
+                sorter.add_encoded(index, pickle.dumps((number, index)))
 
     concurrently(add)
     assert len(sorter) == THREADS * 5_000
-    items = list(sorter)
+    items = list(sorter.sort())
     assert [index for _, index in items] == sorted(index for _, index in items)
     assert sorted(items) == sorted(
         (number, index) for number in range(THREADS) for index in range(5_000)
@@ -89,8 +90,7 @@ def test_threads_adding_to_one_sorter_lose_nothing(tmp_path: Path) -> None:
 
 def test_threads_reading_one_iterator_share_its_items(tmp_path: Path) -> None:
     sorter: Sorter[int] = Sorter(max_bytes=4_096, tmp_dir=tmp_path)
-    sorter.extend(range(40_000, 0, -1))
-    iterator = iter(sorter)
+    iterator = sorter.sort(range(40_000, 0, -1))
     parts: list[list[int]] = [[] for _ in range(THREADS)]
 
     def read(number: int) -> None:

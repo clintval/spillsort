@@ -24,12 +24,12 @@ class _Writable(Protocol):
 
 @final
 class Sorter(Generic[_T]):
-    """Sort more items than fit in memory: add them, then read them once, sorted.
+    """Sort more items than fit in memory: add them, then sort them once.
 
     Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`,
     or by pickle, once, as it is added. Keys and bytes are held in up to `max_bytes` of memory.
     Once half of that fills, a background thread sorts it and writes it to a private directory in
-    `tmp_dir` while the other half fills. Reading merges what was written with what is held, so
+    `tmp_dir` while the other half fills. Sorting merges what was written with what is held, so
     items come out in key order, and items with equal keys come out in the order they were added.
 
     The private directory is removed when reading ends, on `close()`, when a `with` block exits,
@@ -41,12 +41,14 @@ class Sorter(Generic[_T]):
             themselves.
         codec: Encodes each item into bytes and decodes it back; pickle if None.
         max_bytes: The most bytes of keys and encoded items to hold in memory, at least 2.
-        tmp_dir: The directory to spill into, or None for the system's temporary directory.
+        tmp_dir: The directory to spill into, or None for `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
+        threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
+            a pool of this sorter's own.
 
     Raises:
         TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.
-        ValueError: If `max_bytes` or `max_open` is less than 2.
+        ValueError: If `max_bytes` or `max_open` is less than 2, or `threads` is less than 1.
         OSError: If `tmp_dir` is not a directory.
     """
 
@@ -59,6 +61,7 @@ class Sorter(Generic[_T]):
         max_bytes: int = 268_435_456,
         tmp_dir: str | PathLike[str] | None = None,
         max_open: int = 64,
+        threads: int = 1,
     ) -> None: ...
     def add(self, item: _T, /) -> None:
         """Add an item, keyed and encoded now.
@@ -70,25 +73,23 @@ class Sorter(Generic[_T]):
             OSError: If spilling to disk fails.
         """
 
-    def extend(self, items: Iterable[_T], /) -> None:
-        """Add every item, keyed and encoded now; items before one that fails stay added."""
-
     def add_encoded(self, key: SortKey, payload: bytes, /) -> None:
         """Add bytes that the codec would decode, with their sort key, calling neither."""
-
-    def extend_encoded(self, pairs: Iterable[tuple[SortKey, bytes]], /) -> None:
-        """Add every `(key, payload)` pair, calling neither the key function nor the codec."""
 
     def __len__(self) -> int:
         """The number of items added."""
 
-    def __iter__(self) -> SortedIterator[_T]:
-        """Return the items, decoded, in sorted order; a sorter can be read only once.
+    def sort(self, items: Iterable[_T] = ..., /) -> SortedIterator[_T]:
+        """Add every item given, then return every item added, decoded, in sorted order.
+
+        Items are keyed and encoded as they are added. A sorter can be sorted only once; items
+        given before one that fails stay added, and the sorter is not sorted.
 
         Raises:
+            TypeError: If a key is not a sort key, or the codec does not return bytes.
             ValueError: If the sorter is closed; also raised by the iterator once it is.
-            RuntimeError: If the sorter has been read, or an earlier error lost items.
-            OSError: If reading what was spilled fails.
+            RuntimeError: If the sorter has been sorted, or an earlier error lost items.
+            OSError: If spilling, or reading what was spilled, fails.
         """
 
     def encoded(self) -> SortedIterator[bytes]:

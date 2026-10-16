@@ -42,7 +42,8 @@ use std::io;
 
 pub use merge::Merged;
 pub use sorter::{
-    Config, DEFAULT_MAX_BYTES, DEFAULT_MAX_OPEN, MIN_MAX_BYTES, MIN_MAX_OPEN, Sorter,
+    Config, DEFAULT_MAX_BYTES, DEFAULT_MAX_OPEN, DEFAULT_THREADS, MIN_MAX_BYTES, MIN_MAX_OPEN,
+    Sorter,
 };
 
 #[cfg(doctest)]

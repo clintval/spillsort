@@ -17,8 +17,8 @@ Each method runs three times, each in its own process, and the table shows the f
 | `spillsort items` | Adds the tuples to spillsort, pickled, then reads them back                                    |
 | `generate lines`  | Makes `(key, line)` pairs and nothing else, the least any `lines` method can take              |
 | `sorted() lines`  | Sorts the pairs by key in memory, then writes the lines to a file                              |
-| `baseline lines`  | `extend_encoded` of the pairs into the pure-Python sorter, then `write_to` a file              |
-| `spillsort lines` | `extend_encoded` of the pairs into spillsort, then `write_to` a file                           |
+| `baseline lines`  | `add_encoded` of each pair into the pure-Python sorter, then `write_to` a file                 |
+| `spillsort lines` | `add_encoded` of each pair into spillsort, then `write_to` a file                              |
 
 Results on an Apple M3 Max with 16 cores and Python 3.11, for 2 million tuples:
 

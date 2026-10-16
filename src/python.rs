@@ -322,12 +322,12 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
         .map_or_else(|_| "?".to_owned(), |name| name.to_string())
 }
 
-/// Sort more items than fit in memory: add them, then read them once, sorted.
+/// Sort more items than fit in memory: add them, then sort them once.
 ///
 /// Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`,
 /// or by pickle, once, as it is added. Keys and bytes are held in up to `max_bytes` of memory.
 /// Once half of that fills, a background thread sorts it and writes it to a private directory in
-/// `tmp_dir` while the other half fills. Reading merges what was written with what is held, so
+/// `tmp_dir` while the other half fills. Sorting merges what was written with what is held, so
 /// items come out in key order, and items with equal keys come out in the order they were added.
 ///
 /// The private directory is removed when reading ends, on `close()`, when a `with` block exits,
@@ -339,12 +339,14 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
 ///         themselves.
 ///     codec: Encodes each item into bytes and decodes it back; pickle if None.
 ///     max_bytes: The most bytes of keys and encoded items to hold in memory, at least 2.
-///     tmp_dir: The directory to spill into, or None for the system's temporary directory.
+///     tmp_dir: The directory to spill into, or None for `tempfile.gettempdir()`.
 ///     max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
+///     threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
+///         a pool of this sorter's own.
 ///
 /// Raises:
 ///     TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.
-///     ValueError: If `max_bytes` or `max_open` is less than 2.
+///     ValueError: If `max_bytes` or `max_open` is less than 2, or `threads` is less than 1.
 ///     OSError: If `tmp_dir` is not a directory.
 #[pyclass(module = "spillsort", name = "Sorter", frozen, generic)]
 struct PySorter {
@@ -462,7 +464,7 @@ impl PySorter {
 #[pymethods]
 impl PySorter {
     #[new]
-    #[pyo3(signature = (key = None, /, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64))]
+    #[pyo3(signature = (key = None, /, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64, threads = 1))]
     fn new(
         py: Python<'_>,
         key: Option<Bound<'_, PyAny>>,
@@ -470,6 +472,7 @@ impl PySorter {
         max_bytes: i64,
         tmp_dir: Option<PathBuf>,
         max_open: i64,
+        threads: i64,
     ) -> PyResult<Self> {
         if let Some(function) = &key
             && !function.is_callable()
@@ -497,10 +500,18 @@ impl PySorter {
                 (Encoder::Pickle(dumps), pickle.getattr("loads")?.unbind())
             }
         };
+        let tmp_dir = match tmp_dir {
+            Some(dir) => dir,
+            None => py
+                .import("tempfile")?
+                .call_method0("gettempdir")?
+                .extract::<PathBuf>()?,
+        };
         let config = Config {
             max_bytes: setting("max_bytes", max_bytes, MIN_MAX_BYTES)?,
-            tmp_dir,
+            tmp_dir: Some(tmp_dir),
             max_open: setting("max_open", max_open, MIN_MAX_OPEN)?,
+            threads: setting("threads", threads, 1)?,
         };
         let sorter = CoreSorter::new(config).map_err(to_python)?;
         Ok(PySorter {
@@ -525,39 +536,10 @@ impl PySorter {
         self.push_item(py, item, &mut Vec::with_capacity(64))
     }
 
-    /// Add every item, keyed and encoded now; items before one that fails stay added.
-    fn extend(&self, py: Python<'_>, items: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_adding()?;
-        let mut key = Vec::with_capacity(64);
-        for item in items.try_iter()? {
-            self.push_item(py, &item?, &mut key)?;
-        }
-        Ok(())
-    }
-
     /// Add bytes that the codec would decode, with their sort key, calling neither.
     fn add_encoded(&self, py: Python<'_>, key: &Bound<'_, PyAny>, payload: &[u8]) -> PyResult<()> {
         self.check_adding()?;
         self.push_encoded(py, key, payload, &mut Vec::with_capacity(64))
-    }
-
-    /// Add every `(key, payload)` pair, calling neither the key function nor the codec.
-    fn extend_encoded(&self, py: Python<'_>, pairs: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.check_adding()?;
-        let mut buffer = Vec::with_capacity(64);
-        for pair in pairs.try_iter()? {
-            let pair = pair?;
-            let (key, payload) = pair
-                .extract::<(Bound<'_, PyAny>, Bound<'_, PyBytes>)>()
-                .map_err(|_| {
-                    PyTypeError::new_err(format!(
-                        "extend_encoded takes (key, bytes) tuples, not {}",
-                        type_name(&pair)
-                    ))
-                })?;
-            self.push_encoded(py, &key, payload.as_bytes(), &mut buffer)?;
-        }
-        Ok(())
     }
 
     /// The number of items added.
@@ -565,13 +547,25 @@ impl PySorter {
         self.added.load(Ordering::Relaxed) as usize
     }
 
-    /// Return the items, decoded, in sorted order; a sorter can be read only once.
+    /// Add every item given, then return every item added, decoded, in sorted order.
+    ///
+    /// Items are keyed and encoded as they are added. A sorter can be sorted only once; items
+    /// given before one that fails stay added, and the sorter is not sorted.
     ///
     /// Raises:
+    ///     TypeError: If a key is not a sort key, or the codec does not return bytes.
     ///     ValueError: If the sorter is closed; also raised by the iterator once it is.
-    ///     RuntimeError: If the sorter has been read, or an earlier error lost items.
-    ///     OSError: If reading what was spilled fails.
-    fn __iter__(&self, py: Python<'_>) -> PyResult<SortedIterator> {
+    ///     RuntimeError: If the sorter has been sorted, or an earlier error lost items.
+    ///     OSError: If spilling, or reading what was spilled, fails.
+    #[pyo3(signature = (items = None, /))]
+    fn sort(&self, py: Python<'_>, items: Option<&Bound<'_, PyAny>>) -> PyResult<SortedIterator> {
+        if let Some(items) = items {
+            self.check_adding()?;
+            let mut key = Vec::with_capacity(64);
+            for item in items.try_iter()? {
+                self.push_item(py, &item?, &mut key)?;
+            }
+        }
         self.iterator(py, Some(self.decode.clone_ref(py)))
     }
 
