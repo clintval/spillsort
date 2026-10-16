@@ -73,11 +73,9 @@ def test_threads_adding_to_one_sorter_lose_nothing(tmp_path: Path) -> None:
     )
 
     def add(number: int) -> None:
-        for index in range(5_000):
-            if index % 2:
-                sorter.add((number, index))
-            else:
-                sorter.add_encoded(index, pickle.dumps((number, index)))
+        for index in range(0, 5_000, 4):
+            sorter.add_encoded(index, pickle.dumps((number, index)))
+            sorter.add(*((number, following) for following in range(index + 1, index + 4)))
 
     concurrently(add)
     assert len(sorter) == THREADS * 5_000

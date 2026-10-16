@@ -79,11 +79,13 @@ class Sorter(Generic[_T]):
         max_open: int = 64,
         threads: int = 1,
     ) -> None: ...
-    def add(self, item: _T, /) -> None:
-        """Add an item, keyed and encoded now.
+    def add(self, *items: _T) -> None:
+        """Add each item given, in order, keyed and encoded now; with none, add nothing.
+
+        Items given before one that fails stay added.
 
         Raises:
-            TypeError: If the key is not a sort key, or the codec does not return bytes.
+            TypeError: If a key is not a sort key, or the codec does not return bytes.
             ValueError: If the sorter is closed.
             RuntimeError: If the sorter has been read, or an earlier error lost items.
             OSError: If spilling to disk fails.
