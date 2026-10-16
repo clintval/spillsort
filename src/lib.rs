@@ -34,6 +34,9 @@ mod merge;
 mod run;
 mod sorter;
 
+#[cfg(feature = "python")]
+mod python;
+
 use std::fmt;
 use std::io;
 
