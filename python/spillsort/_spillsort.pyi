@@ -32,8 +32,8 @@ class Sorter(Generic[_T]):
     `tmp_dir` while the other half fills. Sorting merges what was written with what is held, so
     items come out in key order, and items with equal keys come out in the order they were
     added. A merge reads at most `max_open` runs at once, each a block of up to 128 KiB at a
-    time, holding the block compressed and not, about 256 KiB, and its next item, so it takes
-    about `max_open` times the largest item, plus those blocks, besides what is held.
+    time, holding the block and room for it compressed, about 269 KiB, and its next item, so it
+    takes about `max_open` times the largest item, plus those blocks, besides what is held.
 
     The private directory is removed when reading ends, on `close()`, when a `with` block exits,
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter

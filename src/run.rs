@@ -166,7 +166,8 @@ impl RunWriter {
     }
 }
 
-/// Reads the records of a run, in order, into buffers that are reused, a block at a time.
+/// Reads the records of a run, in order, a block at a time, into a block and room for it
+/// compressed, which it allocates once, at their most: about 269 KiB.
 pub(crate) struct RunReader {
     file: File,
     path: PathBuf,
@@ -257,6 +258,11 @@ impl RunReader {
         let length = u32::from_le_bytes([u0, u1, u2, u3]) as usize;
         if length == 0 || length > BLOCK || size == 0 || size > get_maximum_output_size(length) {
             return Err(corrupt("a block has an impossible length"));
+        }
+        if self.block.capacity() == 0 {
+            self.compressed
+                .reserve_exact(get_maximum_output_size(BLOCK));
+            self.block.reserve_exact(BLOCK);
         }
         self.compressed.resize(size, 0);
         self.file.read_exact(&mut self.compressed)?;
@@ -508,6 +514,48 @@ mod tests {
         let error = reader.read_into(&mut key, &mut value).unwrap_err();
         assert_error(&error, InvalidData, "is corrupt: a record is longer");
         assert!(key.capacity() < 1 << 10, "{}", key.capacity());
+    }
+
+    #[test]
+    fn a_reader_holds_a_block_and_the_most_it_compresses_to_however_well_blocks_compress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = RunWriter::create(dir.path().join("run"), None).unwrap();
+        let mut state = 5u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 33
+        };
+        for alphabet in (1..=256).step_by(15) {
+            for _ in 0..BLOCK / 200 {
+                let value: Vec<u8> = (0..192).map(|_| (random() % alphabet) as u8).collect();
+                writer.push(b"key", &value).unwrap();
+            }
+        }
+        let run = writer.finish().unwrap();
+        let bytes = fs::read(&run.path).unwrap();
+        let sizes: Vec<usize> = block_offsets(&bytes)
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert!(
+            sizes.windows(2).any(|pair| pair[1] > 2 * pair[0]),
+            "{sizes:?}"
+        );
+        let mut reader = RunReader::open(&run).unwrap();
+        let (mut key, mut value) = (Vec::new(), Vec::new());
+        let mut held = Vec::new();
+        while reader.read_into(&mut key, &mut value).unwrap() {
+            held.push(reader.block.capacity() + reader.compressed.capacity());
+        }
+        let most = BLOCK + get_maximum_output_size(BLOCK);
+        assert!(
+            held.iter().all(|&bytes| bytes <= most),
+            "{:?}",
+            held.iter().max()
+        );
+        assert!(held.iter().all(|&bytes| bytes == most));
     }
 
     #[test]

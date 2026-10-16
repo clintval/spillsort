@@ -241,8 +241,8 @@ pub struct Config {
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
     /// into one first, as many times as it takes. A merge reads each run a block of up to 128 KiB
-    /// at a time, holding the block compressed and not, about 256 KiB, and its next record, so it
-    /// takes about this many times the largest record, plus those blocks.
+    /// at a time, holding the block and room for it compressed, about 269 KiB, and its next
+    /// record, so it takes about this many times the largest record, plus those blocks.
     pub max_open: usize,
     /// The threads that sort each chunk and compress each run: with 1, the thread that spills it,
     /// and with more, a pool of this sorter's own, which compresses two 128 KiB blocks for each
