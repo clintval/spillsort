@@ -372,13 +372,27 @@ def test_a_failed_spill_refuses_to_go_on(tmp_path: Path) -> None:
         list(sorter.sort())
 
 
+def test_spilled_runs_are_compressed(tmp_path: Path) -> None:
+    max_bytes = 2**20
+    sorter: Sorter[bytes] = Sorter(max_bytes=max_bytes, tmp_dir=tmp_path)
+    index = 0
+    while len(spilled(tmp_path)) < 3:
+        sorter.add_encoded(-index, b"ACGT" * 50 + str(index).encode())
+        index += 1
+    sizes = [path.stat().st_size for path in spilled(tmp_path)[:2]]
+    assert all(0 < size < max_bytes // 8 for size in sizes), sizes
+    encoded = list(sorter.encoded())
+    assert len(encoded) == index
+    assert encoded[0] == b"ACGT" * 50 + str(index - 1).encode()
+
+
 def test_a_run_that_is_cut_short_is_an_error_when_read(tmp_path: Path) -> None:
-    sorter: Sorter[int] = Sorter(max_bytes=256, tmp_dir=tmp_path)
+    sorter: Sorter[int] = Sorter(max_bytes=2**20, tmp_dir=tmp_path)
     wait_for_runs(sorter, tmp_path, 3)
     first = spilled(tmp_path)[0]
     first.write_bytes(first.read_bytes()[:-1])
     iterator = sorter.sort()
-    with pytest.raises(OSError, match="is corrupt: a record is longer than the rest of the run"):
+    with pytest.raises(OSError, match="ended before its last record"):
         list(iterator)
     assert list(tmp_path.iterdir()) == []
     assert next(iterator, None) is None
