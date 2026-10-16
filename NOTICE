@@ -1,0 +1,13 @@
+spillsort
+Copyright © 2026 Clint Valentine
+
+The design follows the Sorter of fgbio (https://github.com/fulcrumgenomics/fgbio,
+MIT), which encodes items as they are added and holds bytes in memory, and the
+SortingCollection of htsjdk (https://github.com/samtools/htsjdk, MIT), which
+reads once and keeps records with equal keys in the order they were added. No
+code is copied from either.
+
+Sorting in parallel uses rayon (https://github.com/rayon-rs/rayon, MIT or
+Apache-2.0), and temporary directories are made with tempfile
+(https://github.com/Stebalien/tempfile, MIT or Apache-2.0). The Python bindings
+use PyO3 (https://github.com/PyO3/pyo3, MIT or Apache-2.0).
