@@ -88,7 +88,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,6 +101,10 @@ jobs:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: "false"
+
+      - name: Check that the interpreter is free-threaded
+        if: ${{ endsWith(matrix.python-version, 't') }}
+        run: uv run --locked python -c "import sysconfig; assert sysconfig.get_config_var('Py_GIL_DISABLED')"
 
       - name: Test the library
         run: uv run --locked poe check-tests
