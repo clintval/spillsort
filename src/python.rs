@@ -6,7 +6,7 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 
@@ -16,6 +16,7 @@ use pyo3::types::{IntoPyDict, PyBytes, PyFloat, PyInt, PyList, PyString, PyTuple
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::key;
+use crate::sorter::POLL;
 use crate::{
     Config, DEFAULT_MAX_BYTES, DEFAULT_MAX_OPEN, Error, MIN_MAX_BYTES, MIN_MAX_OPEN, Merged,
     Sorter as CoreSorter,
@@ -50,6 +51,26 @@ fn read_twice_error() -> PyErr {
 
 fn added_after_read_error() -> PyErr {
     PyRuntimeError::new_err("cannot add to a sorter once it has been read")
+}
+
+fn check_signals(py: Python<'_>) -> PyResult<()> {
+    py.check_signals()
+}
+
+/// Runs any signal handlers, as Python does between bytecodes, from a thread that has detached,
+/// and returns true once one has raised, keeping what it raised.
+fn interrupted(raised: &mut Option<PyErr>) -> bool {
+    if raised.is_none()
+        && let Err(error) = Python::attach(check_signals)
+    {
+        *raised = Some(error);
+    }
+    raised.is_some()
+}
+
+/// What a signal handler raised, if one did, or else this error.
+fn raised_or(raised: &mut Option<PyErr>, error: Error) -> PyErr {
+    raised.take().unwrap_or_else(|| to_python(error))
 }
 
 /// Returns an address that no other running thread shares.
@@ -186,6 +207,13 @@ impl State {
 
     fn needs_refill(&self) -> bool {
         matches!(self, State::Reading(_, batch) if batch.is_drained())
+    }
+
+    /// Ends reading, dropping the merge, which removes what was spilled.
+    fn end(&mut self) {
+        if matches!(self, State::Reading(..)) {
+            *self = State::Read;
+        }
     }
 
     fn next_value(&mut self) -> PyResult<Option<&[u8]>> {
@@ -335,6 +363,9 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
 /// or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
 /// must not be shared across a fork: make a new one in the child.
 ///
+/// Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
+/// reading; an interrupted merge or read ends the sort and removes what was spilled.
+///
 /// Args:
 ///     key: A function returning the sort key of an item: an int, float, str, bytes, None, or a
 ///         tuple or list of them, compared as Python compares them. None sorts items by
@@ -370,9 +401,18 @@ impl PySorter {
         }
     }
 
+    /// Adds a record, first waiting without the GIL, as a signal allows, for a spill that pushing
+    /// it would wait for.
     fn push(&self, py: Python<'_>, key: &[u8], payload: &[u8]) -> PyResult<()> {
         let push = |state: &mut State| match state {
-            State::Adding(sorter) => sorter.push(key, payload).map_err(to_python),
+            State::Adding(sorter) => {
+                if sorter.would_spill(key.len() + payload.len()) {
+                    let mut raised = None;
+                    let waited = sorter.wait_or_stop(&mut || interrupted(&mut raised));
+                    waited.map_err(|error| raised_or(&mut raised, error))?;
+                }
+                sorter.push(key, payload).map_err(to_python)
+            }
             State::Reading(..) | State::Read => Err(added_after_read_error()),
             State::Closed => Err(closed_error()),
         };
@@ -435,7 +475,9 @@ impl PySorter {
             match mem::replace(&mut *state, State::Read) {
                 State::Adding(sorter) => {
                     self.status.store(READ, Ordering::Release);
-                    let merged = sorter.finish().map_err(to_python)?;
+                    let mut raised = None;
+                    let finished = sorter.finish_or_stop(&mut || interrupted(&mut raised));
+                    let merged = finished.map_err(|error| raised_or(&mut raised, error))?;
                     if iterate {
                         *state = State::Reading(merged, Batch::default());
                         Ok(None)
@@ -613,12 +655,14 @@ impl PySorter {
                 let waiting = receiver
                     .take()
                     .expect("the receiver is put back after each message");
-                let (message, waiting) = py.detach(move || (waiting.recv(), waiting));
+                let (message, waiting) = py.detach(move || (waiting.recv_timeout(POLL), waiting));
                 receiver = Some(waiting);
-                let Ok(message) = message else {
-                    return Ok(());
-                };
-                write_all(&write, &message.map_err(to_python)?)?;
+                match message {
+                    Ok(message) => write_all(&write, &message.map_err(to_python)?)?,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+                py.check_signals()?;
             }
         })();
         drop(receiver);
@@ -683,22 +727,37 @@ impl SortedIterator {
         slf
     }
 
+    /// Returns the next item, merging the next batch first if this one is drained and no signal
+    /// handler raises, which would end reading.
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let value = match self.state.try_lock() {
             Some(mut guard) => {
                 let state = &mut *guard;
                 if state.needs_refill() {
+                    if let Err(error) = py.check_signals() {
+                        py.detach(|| state.end());
+                        return Err(error);
+                    }
                     py.detach(|| state.refill_if_drained())?;
                 }
                 state.next_value()?.map(|value| PyBytes::new(py, value))
             }
-            None => py
-                .detach(|| -> PyResult<Option<Vec<u8>>> {
+            None => {
+                let mut raised = None;
+                let value = py.detach(|| -> PyResult<Option<Vec<u8>>> {
                     let mut state = self.state.lock()?;
+                    if state.needs_refill() && interrupted(&mut raised) {
+                        state.end();
+                        return Ok(None);
+                    }
                     state.refill_if_drained()?;
                     Ok(state.next_value()?.map(<[u8]>::to_vec))
-                })?
-                .map(|value| PyBytes::new(py, &value)),
+                })?;
+                if let Some(error) = raised {
+                    return Err(error);
+                }
+                value.map(|value| PyBytes::new(py, &value))
+            }
         };
         let Some(value) = value else {
             return Ok(None);

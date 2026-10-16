@@ -8,7 +8,9 @@ use std::mem;
 use std::panic;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use rayon::slice::ParallelSliceMut;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -41,6 +43,12 @@ const MIN_ARENA: usize = 64 << 10;
 
 /// The fewest records a chunk makes room for, unless the memory limit is smaller.
 const MIN_ENTRIES: usize = 1 << 10;
+
+/// How long a wait goes on before asking whether to stop.
+pub(crate) const POLL: Duration = Duration::from_millis(50);
+
+/// How many records a merge pass writes between asking whether to stop.
+const RECORDS_PER_ASK: u64 = 1 << 16;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -295,9 +303,20 @@ pub struct Sorter {
     dir: Option<TempDir>,
     runs: Vec<Run>,
     made: usize,
-    pending: Option<JoinHandle<io::Result<Chunk>>>,
+    pending: Option<Pending>,
     count: u64,
     failed: bool,
+}
+
+/// A spill in progress: the thread that sorts and writes a chunk, and sends it back emptied.
+struct Pending {
+    handle: JoinHandle<()>,
+    done: Receiver<io::Result<Chunk>>,
+}
+
+/// The error for work given up because the caller asked to stop.
+fn stopped() -> Error {
+    Error::Io(io::ErrorKind::Interrupted.into())
 }
 
 impl Sorter {
@@ -397,13 +416,19 @@ impl Sorter {
     }
 
     /// Stops adding and returns every record, merged in order.
-    pub fn finish(mut self) -> Result<Merged> {
+    pub fn finish(self) -> Result<Merged> {
+        self.finish_or_stop(&mut || false)
+    }
+
+    /// Finishes, asking `stop` now and then while waiting and merging whether to give up, which
+    /// drops the sorter and so removes what it spilled.
+    pub(crate) fn finish_or_stop(mut self, stop: &mut dyn FnMut() -> bool) -> Result<Merged> {
         if self.failed {
             return Err(Error::Failed);
         }
-        self.wait()?;
+        self.wait_or_stop(stop)?;
         self.spare = None;
-        self.reduce()?;
+        self.reduce(stop)?;
         let mut chunk = mem::take(&mut self.chunk);
         chunk.sort(self.pool.as_deref());
         let mut sources = self
@@ -437,12 +462,30 @@ impl Sorter {
 
     /// Waits for the spill in progress, keeping its chunk to fill next.
     fn wait(&mut self) -> Result<()> {
-        if let Some(handle) = self.pending.take() {
-            match handle.join() {
-                Ok(spilled) => self.spare = Some(spilled?),
-                Err(panicked) => panic::resume_unwind(panicked),
+        self.wait_or_stop(&mut || false)
+    }
+
+    /// Waits for the spill in progress, asking `stop` now and then whether to give up waiting,
+    /// which leaves the spill in progress. A spill that failed lost records, so the sorter fails.
+    pub(crate) fn wait_or_stop(&mut self, stop: &mut dyn FnMut() -> bool) -> Result<()> {
+        let Some(pending) = &self.pending else {
+            return Ok(());
+        };
+        let received = loop {
+            match pending.done.recv_timeout(POLL) {
+                Ok(spilled) => break Some(spilled),
+                Err(RecvTimeoutError::Timeout) if stop() => return Err(stopped()),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break None,
             }
+        };
+        if let Some(Pending { handle, .. }) = self.pending.take()
+            && let Err(panicked) = handle.join()
+        {
+            panic::resume_unwind(panicked);
         }
+        let spilled = received.unwrap_or_else(|| Err(io::Error::other("a spill stopped")));
+        self.spare = Some(spilled.inspect_err(|_| self.failed = true)?);
         Ok(())
     }
 
@@ -456,23 +499,30 @@ impl Sorter {
             bytes: chunk.run_bytes(),
         });
         let (pool, limit) = (self.pool.clone(), self.limit);
+        let (sender, done) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("spillsort-spill".to_owned())
             .spawn(move || {
                 chunk.sort(pool.as_deref());
-                chunk.write_run(path)?;
-                chunk.clear(limit);
-                Ok(chunk)
+                let written = chunk.write_run(path).map(|_| {
+                    chunk.clear(limit);
+                    chunk
+                });
+                let _ = sender.send(written);
             })?;
-        self.pending = Some(handle);
+        self.pending = Some(Pending { handle, done });
         Ok(())
     }
 
     /// Merges neighboring runs, so equal keys stay stable, until no more than `max_open` remain,
     /// each time merging only as many as are too many, and the neighbors with the fewest bytes.
-    fn reduce(&mut self) -> Result<()> {
+    /// Before each merge, and now and then during one, it asks `stop` whether to give up.
+    fn reduce(&mut self, stop: &mut dyn FnMut() -> bool) -> Result<()> {
         let max_open = self.config.max_open;
         while self.runs.len() > max_open {
+            if stop() {
+                return Err(stopped());
+            }
             let count = (self.runs.len() - max_open + 1).min(max_open);
             let start = self
                 .runs
@@ -491,6 +541,9 @@ impl Sorter {
             let mut out = RunWriter::create(self.next_path()?)?;
             while let Some((key, value)) = merged.next_record()? {
                 out.push(key, value)?;
+                if out.records() % RECORDS_PER_ASK == 0 && stop() {
+                    return Err(stopped());
+                }
             }
             drop(merged);
             self.runs.splice(start..start + count, [out.finish()?]);
@@ -504,7 +557,7 @@ impl Sorter {
 
 impl Drop for Sorter {
     fn drop(&mut self) {
-        if let Some(handle) = self.pending.take() {
+        if let Some(Pending { handle, .. }) = self.pending.take() {
             let _ = handle.join();
         }
     }
@@ -600,7 +653,7 @@ mod tests {
         sorter.wait().unwrap();
         let records = sorter.runs[0].records;
         assert!(sorter.runs.iter().all(|run| run.records == records));
-        sorter.reduce().unwrap();
+        sorter.reduce(&mut || false).unwrap();
         assert_eq!(sorter.runs(), 64);
         assert_eq!(sorter.made, 66);
         assert_eq!(sorter.runs[0].records, 2 * records);
@@ -689,6 +742,26 @@ mod tests {
         }
         assert_eq!(entries(root.path()), 0);
         assert!(merged.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn stops_merging_when_asked_and_removes_its_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(64, 2, root.path())).unwrap();
+        for value in 0u32..500 {
+            sorter.push(&value.to_be_bytes(), b"value").unwrap();
+        }
+        assert!(sorter.runs() > 3);
+        let mut asked = 0;
+        let error = sorter
+            .finish_or_stop(&mut || {
+                asked += 1;
+                asked > 2
+            })
+            .unwrap_err();
+        assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(asked, 3);
+        assert_eq!(entries(root.path()), 0);
     }
 
     #[test]

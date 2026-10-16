@@ -37,6 +37,9 @@ class Sorter(Generic[_T]):
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
     must not be shared across a fork: make a new one in the child.
 
+    Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
+    reading; an interrupted merge or read ends the sort and removes what was spilled.
+
     Args:
         key: A function returning the sort key of an item: an int, float, str, bytes, None, or a
             tuple or list of them, compared as Python compares them. None sorts items by

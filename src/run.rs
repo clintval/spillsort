@@ -61,6 +61,11 @@ impl RunWriter {
         written.map_err(|error| with_path(&error, &self.path))
     }
 
+    /// The number of records written so far.
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
     pub fn finish(self) -> io::Result<Run> {
         let RunWriter {
             out,
