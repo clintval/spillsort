@@ -331,7 +331,8 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
 /// items come out in key order, and items with equal keys come out in the order they were added.
 ///
 /// The private directory is removed when reading ends, on `close()`, when a `with` block exits,
-/// or when the sorter is garbage collected. Threads sharing a sorter take turns.
+/// or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
+/// must not be shared across a fork: make a new one in the child.
 ///
 /// Args:
 ///     key: A function returning the sort key of an item: an int, float, str, bytes, None, or a

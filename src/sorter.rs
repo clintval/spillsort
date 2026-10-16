@@ -192,7 +192,8 @@ impl Config {
 /// Runs are written to a private directory, made at the first spill, which is removed when the
 /// [`Merged`] records have all been read, or when the sorter or the merge is dropped. After an
 /// error while spilling, records may have been lost, so the sorter refuses to go on with
-/// [`Error::Failed`].
+/// [`Error::Failed`]. A sorter must not be shared across a fork, since its threads stay in the
+/// parent: make a new one in the child.
 pub struct Sorter {
     config: Config,
     pool: Option<Arc<ThreadPool>>,
