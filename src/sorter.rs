@@ -347,6 +347,11 @@ impl Sorter {
                 config.max_open
             )));
         }
+        if config.threads == 0 {
+            return Err(Error::Invalid(
+                "threads must be at least 1, not 0".to_owned(),
+            ));
+        }
         if let Some(dir) = &config.tmp_dir {
             let metadata = fs::metadata(dir).map_err(|error| {
                 io::Error::new(error.kind(), format!("{}: {error}", dir.display()))
@@ -357,11 +362,6 @@ impl Sorter {
             }
         }
         make_dir(config.tmp_dir.as_deref())?;
-        if config.threads == 0 {
-            return Err(Error::Invalid(
-                "threads must be at least 1, not 0".to_owned(),
-            ));
-        }
         let pool = if config.threads > 1 {
             let pool = ThreadPoolBuilder::new()
                 .num_threads(config.threads)
@@ -634,6 +634,13 @@ mod tests {
             expected.sort_by_key(|record| record.0);
             prop_assert_eq!(sorted_by_sorter(&records, max_bytes, max_open), expected);
         }
+    }
+
+    #[test]
+    fn checks_threads_before_looking_at_the_tmp_dir() {
+        let missing = std::env::temp_dir().join("spillsort-a-directory-that-does-not-exist");
+        let error = Sorter::new(Config::default().threads(0).tmp_dir(missing)).unwrap_err();
+        assert!(matches!(error, crate::Error::Invalid(_)), "{error}");
     }
 
     #[test]
