@@ -21,7 +21,7 @@ cargo add spillsort
 
 ## Introduction
 
-`spillsort` sorts like `sorted(items, key=...)`, but in a fixed amount of memory.
+This library sorts like `sorted(items, key=...)`, but in a fixed amount of memory.
 Each item is keyed and encoded into bytes once, as it is added.
 When the memory fills, a background thread sorts it and writes it to a temporary file while you keep adding.
 Sorting merges those files with what is still in memory, so items come out in key order, and items with equal keys come out in the order they were added.
@@ -42,7 +42,7 @@ with Sorter(lambda read: (read[0], read[1])) as sorter:
 assert ordered == [("chr1", 100, "read3"), ("chr1", 900, "read2"), ("chr1", 900, "read4"), ("chr2", 500, "read1")]
 ```
 
-Add items one at a time as they arrive, bound the memory with `max_bytes`, and choose where to spill with `tmp_dir`:
+Add items one at a time as they arrive, bound the memory with `max_bytes`, sort on more threads with `threads`, and choose where to spill with `tmp_dir`:
 
 ```python
 import random
@@ -50,7 +50,7 @@ from tempfile import mkdtemp
 
 numbers = [random.random() for _ in range(100_000)]
 
-with Sorter(max_bytes=2**20, tmp_dir=mkdtemp()) as sorter:
+with Sorter(max_bytes=2**20, threads=4, tmp_dir=mkdtemp()) as sorter:
     for number in numbers:
         sorter.add(number)
     ordered = list(sorter.sort())
@@ -115,28 +115,14 @@ See the [API documentation](https://docs.rs/spillsort) for the crate.
 
 ## Keys
 
-A key is an int, float, str, bytes, None, or a tuple or list of them, and keys compare as Python compares them.
-Ints and floats of any size compare exactly, so `1 == 1.0 == True` and `2**53 + 1 > 2.0**53`, and text compares by code point.
-Each key is encoded once into bytes that compare as the key does, so sorting and merging compare bytes and never call Python.
-Values that Python refuses to compare, such as None and an int in the same position, sort by kind: None, numbers, text, bytes, tuples, then lists.
-NaN sorts after every number.
-Objects with `__index__`, such as NumPy integers, are ints; anything else raises `TypeError` when it is added.
+Keys compare exactly as Python compares them, even ints and floats of any size, and NaN sorts last:
 
-## Codecs
+```python
+with Sorter() as sorter:
+    ordered = list(sorter.sort([2**64, float("nan"), 1.5, True, -0.5, 3]))
 
-Without a codec, items are pickled as they are added and unpickled as they are read.
-A codec is any object with `encode(item) -> bytes` and `decode(data) -> item` methods, typed by the `spillsort.Codec` protocol, and each is called once per item.
-`add_encoded` takes bytes the codec would decode, with their key, and calls neither the key function nor the codec.
-`encoded()` yields the sorted bytes without decoding them, and `write_to(handle)` writes them.
-
-## Memory
-
-`max_bytes`, 256 MiB by default, bounds the keys and encoded items held in memory, counting 16 bytes per item for its place.
-Half fills while the other half is sorted and spilled, so adding rarely waits.
-Reading needs a 256 KiB buffer for each spilled run, and when there are more runs than `max_open`, 64 by default, neighboring runs are merged first, in passes.
-Spilled runs go to a private directory in `tmp_dir`, or in `tempfile.gettempdir()`, which is removed when reading ends, on `close()`, when a `with` block exits, or when the sorter is garbage collected.
-Each half is sorted on the thread that spills it, or, with `threads` above 1, on a pool of the sorter's own.
-A sorter is read once, by `sort()`, `encoded()` or `write_to()`, and threads sharing a sorter take turns.
+assert ordered[:-1] == [-0.5, True, 1.5, 3, 2**64]
+```
 
 ## Development and Testing
 
