@@ -45,6 +45,10 @@ pub use sorter::{
     Config, DEFAULT_MAX_BYTES, DEFAULT_MAX_OPEN, MIN_MAX_BYTES, MIN_MAX_OPEN, Sorter,
 };
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// An error from sorting or merging.
 #[derive(Debug)]
 #[non_exhaustive]
