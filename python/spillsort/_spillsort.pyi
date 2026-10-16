@@ -55,7 +55,7 @@ class Sorter(Generic[_T]):
     Raises:
         TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.
         ValueError: If `max_bytes` or `max_open` is less than 2, or `threads` is less than 1.
-        OSError: If `tmp_dir` is not a directory.
+        OSError: If `tmp_dir` is not a directory, or a directory cannot be made in it.
     """
 
     def __init__(

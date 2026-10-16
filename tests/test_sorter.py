@@ -2,8 +2,10 @@
 
 import gc
 import io
+import os
 import pickle
 import shutil
+import sys
 import tempfile
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -407,6 +409,22 @@ def test_settings_are_checked(tmp_path: Path) -> None:
     (tmp_path / "file").touch()
     with pytest.raises(NotADirectoryError, match="is not a directory"):
         Sorter(tmp_dir=str(tmp_path / "file"))
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="permissions do not stop writing"
+)
+def test_a_tmp_dir_that_cannot_be_written_is_refused_when_the_sorter_is_made(
+    tmp_path: Path,
+) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    try:
+        with pytest.raises(PermissionError, match="locked"):
+            Sorter(tmp_dir=locked)
+    finally:
+        locked.chmod(0o700)
+    assert list(locked.iterdir()) == []
 
 
 def test_a_sorter_can_be_subscripted_but_not_pickled() -> None:

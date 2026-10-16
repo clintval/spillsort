@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -314,14 +314,24 @@ struct Pending {
     done: Receiver<io::Result<Chunk>>,
 }
 
+/// Makes a private directory for runs in `root`, or in the system's temporary directory.
+fn make_dir(root: Option<&Path>) -> io::Result<TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("spillsort-");
+    let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    builder
+        .tempdir_in(&root)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))
+}
+
 /// The error for work given up because the caller asked to stop.
 fn stopped() -> Error {
     Error::Io(io::ErrorKind::Interrupted.into())
 }
 
 impl Sorter {
-    /// Makes a sorter, checking that its settings are valid and that its `tmp_dir` is a
-    /// directory.
+    /// Makes a sorter, checking that its settings are valid and that a directory can be made in
+    /// its `tmp_dir`, by making one and removing it, so a sorter that never spills leaves nothing.
     pub fn new(config: Config) -> Result<Self> {
         if config.max_bytes < MIN_MAX_BYTES {
             return Err(Error::Invalid(format!(
@@ -344,6 +354,7 @@ impl Sorter {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, message).into());
             }
         }
+        make_dir(config.tmp_dir.as_deref())?;
         if config.threads == 0 {
             return Err(Error::Invalid(
                 "threads must be at least 1, not 0".to_owned(),
@@ -445,15 +456,7 @@ impl Sorter {
     fn next_path(&mut self) -> Result<PathBuf> {
         let dir = match &mut self.dir {
             Some(dir) => dir,
-            empty => {
-                let mut builder = tempfile::Builder::new();
-                builder.prefix("spillsort-");
-                let made = match &self.config.tmp_dir {
-                    Some(root) => builder.tempdir_in(root),
-                    None => builder.tempdir(),
-                };
-                empty.insert(made?)
-            }
+            empty => empty.insert(make_dir(self.config.tmp_dir.as_deref())?),
         };
         let path = dir.path().join(format!("run-{:06}", self.made));
         self.made += 1;
@@ -881,6 +884,28 @@ mod tests {
         fs::write(&file, b"").unwrap();
         let error = Sorter::new(Config::default().tmp_dir(&file)).unwrap_err();
         assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::NotADirectory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_tmp_dir_it_cannot_write_to_and_leaves_nothing_in_one_it_can() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let sorter = Sorter::new(config(DEFAULT_MAX_BYTES, 2, root.path())).unwrap();
+        assert_eq!(entries(root.path()), 0);
+        drop(sorter);
+        let locked = root.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(locked.join("probe"), b"").is_err() {
+            let error = Sorter::new(config(64, 2, &locked)).unwrap_err();
+            assert!(
+                matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::PermissionDenied)
+            );
+            assert!(error.to_string().contains("locked"), "{error}");
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
