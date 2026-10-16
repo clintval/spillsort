@@ -30,6 +30,7 @@
 //! # Ok::<(), spillsort::Error>(())
 //! ```
 
+mod channel;
 pub mod key;
 mod merge;
 mod run;

@@ -7,7 +7,8 @@ uv run python -m benchmarks.benchmark 2000000 64
 ```
 
 The arguments are the number of tuples, 2 million by default, and `max_bytes` in MiB for both external sorters, 64 by default.
-Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, and the megabytes it wrote to temporary files.
+Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, and about how many megabytes it wrote to temporary files.
+That count is approximate: a separate process lists the temporary directory every 20 ms and adds up the largest size it saw of each file, so it misses what a file gains after the last look before it is removed, and any file that comes and goes between two looks.
 
 | Method            | What it does                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------|
@@ -46,7 +47,8 @@ And for 10 million tuples, where `sorted()` needs about 3 GB and each external s
 | baseline lines   |   22.72 |     143 |        502 |
 | spillsort lines  |    7.88 |      85 |        269 |
 
-spillsort is faster than `sorted()`, even while it spills to disk, because it compares encoded keys as bytes and sorts on every core, rather than comparing Python tuples one pair at a time.
+spillsort is faster than `sorted()`, even while it spills to disk, because it compares encoded keys as bytes, rather than comparing Python tuples one pair at a time, and sorts and spills each half on a background thread while the other fills.
+These runs use 1 thread, the default, on which compressing every run with LZ4 makes spillsort about 1 to 3% slower than spilling its runs uncompressed; with more threads, as in the BAM benchmark below on 8, it takes the same time.
 
 ## Sorting BAM records
 
@@ -67,7 +69,7 @@ Its records are pairs of 150 bp reads, read 1 first, at random positions weighte
 Most pairs are proper pairs with `150M` CIGARs, some with soft clips or a short insertion or deletion; 2% have one mate unmapped, placed at its mate's position, and 1% have both mates unmapped, with no reference or position.
 Each record has random bases, binned qualities, and `NM`, `MC`, `AS`, `XS`, and `RG` tags.
 
-Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, about 32 MB, and the megabytes it wrote to temporary files.
+Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, about 32 MB, and about how many megabytes it wrote to temporary files, counted every 20 ms as above.
 Since `pysam.sort` runs samtools in the same process, the peak includes samtools.
 Each method reads and writes BAM with the given number of threads decompressing and compressing it, and writes at the default compression level.
 

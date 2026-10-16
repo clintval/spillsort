@@ -8,7 +8,7 @@ use std::mem;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use rayon::slice::ParallelSliceMut;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
+use crate::channel::{self, Receiver};
 use crate::merge::{Merged, Source};
 use crate::run::{Run, RunReader, RunWriter};
 use crate::{Error, Result};
@@ -240,12 +241,14 @@ pub struct Config {
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
     /// into one first, as many times as it takes. A merge reads each run a block of up to 128 KiB
-    /// at a time, holding the block compressed and not, about 256 KiB, and its next record, so it
-    /// takes about this many times the largest record, plus those blocks.
+    /// at a time, holding the block and room for it compressed, about 269 KiB, and its next
+    /// record, so it takes about this many times the largest record, plus those blocks.
     pub max_open: usize,
     /// The threads that sort each chunk and compress each run: with 1, the thread that spills it,
-    /// and with more, a pool of this sorter's own, which compresses two 128 KiB blocks for each
-    /// thread at a time.
+    /// and with more, a pool of this sorter's own. Writing a run holds, beyond `max_bytes`, a 1 MiB
+    /// buffer of what it writes and, for each block compressed at once, a 128 KiB block and room
+    /// for it compressed, about 269 KiB: one block with 1 thread, and with more, two for each
+    /// thread, but at most 16, about 4.2 MiB.
     pub threads: usize,
 }
 
@@ -505,7 +508,7 @@ impl Sorter {
             bytes: chunk.run_bytes(),
         });
         let (pool, limit) = (self.pool.clone(), self.limit);
-        let (sender, done) = mpsc::sync_channel(1);
+        let (sender, done) = channel::sync_channel(1);
         let handle = thread::Builder::new()
             .name("spillsort-spill".to_owned())
             .spawn(move || {
