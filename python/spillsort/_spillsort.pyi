@@ -5,17 +5,18 @@ from os import PathLike
 from types import TracebackType
 from typing import Generic
 from typing import Protocol
-from typing import TypeVar
 from typing import final
+from typing import overload
 
 from typing_extensions import Self
+from typing_extensions import TypeVar
 
 from spillsort._codec import Codec
 from spillsort._codec import SortKey
 
 __all__ = ["Sorter"]
 
-_T = TypeVar("_T")
+_T = TypeVar("_T", default=SortKey)
 
 class _Writable(Protocol):
     def write(self, data: bytes, /) -> object: ...
@@ -56,9 +57,21 @@ class Sorter(Generic[_T]):
         OSError: If `tmp_dir` is not a directory, or a directory cannot be made in it.
     """
 
+    @overload
     def __init__(
         self,
-        key: Callable[[_T], SortKey] | None = None,
+        key: None = None,
+        *,
+        codec: Codec[_T] | None = None,
+        max_bytes: int = 268_435_456,
+        tmp_dir: str | PathLike[str] | None = None,
+        max_open: int = 64,
+        threads: int = 1,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        key: Callable[[_T], SortKey],
         *,
         codec: Codec[_T] | None = None,
         max_bytes: int = 268_435_456,
