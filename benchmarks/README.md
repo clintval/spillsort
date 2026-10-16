@@ -7,7 +7,7 @@ uv run python -m benchmarks.benchmark 2000000 64
 ```
 
 The arguments are the number of tuples, 2 million by default, and `max_bytes` in MiB for both external sorters, 64 by default.
-Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing.
+Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, and the megabytes it wrote to temporary files.
 
 | Method            | What it does                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------|
@@ -20,31 +20,31 @@ Each method runs three times, each in its own process, and the table shows the f
 | `baseline lines`  | `add_encoded` of each pair into the pure-Python sorter, then `write_to` a file                 |
 | `spillsort lines` | `add_encoded` of each pair into spillsort, then `write_to` a file                              |
 
-Results on an Apple M3 Max with 16 cores and Python 3.11, for 2 million tuples:
+Results on an Apple M3 Max with 16 cores and Python 3.11.12 on arm64, at a load average of about 3, for 2 million tuples:
 
-| Method           | Seconds | Peak MB |
-|------------------|--------:|--------:|
-| generate items   |    0.89 |       0 |
-| sorted() items   |    3.05 |     580 |
-| baseline items   |    4.94 |     112 |
-| spillsort items  |    2.06 |      98 |
-| generate lines   |    1.20 |       0 |
-| sorted() lines   |    4.15 |     519 |
-| baseline lines   |    4.38 |     117 |
-| spillsort lines  |    1.50 |     100 |
+| Method           | Seconds | Peak MB | Spilled MB |
+|------------------|--------:|--------:|-----------:|
+| generate items   |    0.85 |       0 |          0 |
+| sorted() items   |    2.89 |     580 |          0 |
+| baseline items   |    4.67 |     112 |         97 |
+| spillsort items  |    1.95 |      89 |         41 |
+| generate lines   |    1.15 |       0 |          0 |
+| sorted() lines   |    3.85 |     519 |          0 |
+| baseline lines   |    4.17 |     116 |         87 |
+| spillsort lines  |    1.55 |      91 |         52 |
 
 And for 10 million tuples, where `sorted()` needs about 3 GB and each external sorter stays under 150 MB:
 
-| Method           | Seconds | Peak MB |
-|------------------|--------:|--------:|
-| generate items   |    4.41 |       0 |
-| sorted() items   |   18.76 |    2909 |
-| baseline items   |   25.52 |     143 |
-| spillsort items  |   10.23 |     101 |
-| generate lines   |    6.04 |       0 |
-| sorted() lines   |   29.67 |    2604 |
-| baseline lines   |   23.56 |     143 |
-| spillsort lines  |    7.74 |     107 |
+| Method           | Seconds | Peak MB | Spilled MB |
+|------------------|--------:|--------:|-----------:|
+| generate items   |    4.23 |       0 |          0 |
+| sorted() items   |   17.56 |    2910 |          0 |
+| baseline items   |   25.19 |     144 |        588 |
+| spillsort items  |    9.86 |      92 |        242 |
+| generate lines   |    5.68 |       0 |          0 |
+| sorted() lines   |   29.54 |    2604 |          0 |
+| baseline lines   |   22.72 |     143 |        502 |
+| spillsort lines  |    7.88 |      85 |        269 |
 
 spillsort is faster than `sorted()`, even while it spills to disk, because it compares encoded keys as bytes and sorts on every core, rather than comparing Python tuples one pair at a time.
 
@@ -67,7 +67,7 @@ Its records are pairs of 150 bp reads, read 1 first, at random positions weighte
 Most pairs are proper pairs with `150M` CIGARs, some with soft clips or a short insertion or deletion; 2% have one mate unmapped, placed at its mate's position, and 1% have both mates unmapped, with no reference or position.
 Each record has random bases, binned qualities, and `NM`, `MC`, `AS`, `XS`, and `RG` tags.
 
-Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, about 32 MB.
+Each method runs three times, each in its own process, and the table shows the fastest run with its peak memory beyond what the process used after importing, about 32 MB, and the megabytes it wrote to temporary files.
 Since `pysam.sort` runs samtools in the same process, the peak includes samtools.
 Each method reads and writes BAM with the given number of threads decompressing and compressing it, and writes at the default compression level.
 
@@ -80,7 +80,7 @@ Each method reads and writes BAM with the given number of threads decompressing 
 | `spillsort codec` | Sorts with `Sorter(key, codec=...).sort(reads)`, a codec doing the same, so spillsort calls the key and codec of each record |
 
 The `-m` option of samtools sort is memory per thread, so it is `max_bytes` divided by the threads, and at least 1 MiB, and samtools holds about `max_bytes` in all, counted as binary records rather than SAM text.
-Its `-@` threads decompress, sort, and compress; spillsort's `threads` sort, and each pysam file has as many again to decompress or compress.
+Its `-@` threads decompress, sort, and compress; spillsort's `threads` sort and compress its runs, and each pysam file has as many again to decompress or compress.
 The spillsort methods write a header marked `SO:coordinate`, as samtools does.
 
 The key is `(reference_id, reference_start, is_reverse)`, with a reference past every real one for records with no reference, which is the order of samtools sort.
@@ -92,38 +92,38 @@ Each output is checked once it is timed: each sorted output must index with `pys
 Indexing accepts references in any order as long as each is contiguous, so only that comparison would catch a key that sorts by reference name.
 The benchmark also reports whether the sorted outputs list the records, by name and flag, in the same order; they did in every run below.
 
-Results on an Apple M3 Max with 16 cores and Python 3.11.12 on arm64, with pysam 0.24.1 and samtools 1.24, for 1 million records, while other work kept the load average at about 6 to 9, so times vary by several percent between runs:
+Results on an Apple M3 Max with 16 cores and Python 3.11.12 on arm64, with pysam 0.24.1 and samtools 1.24, for 1 million records, while other work kept the load average at about 3 to 5, so times vary by a few percent between runs:
 
-| Method          | Threads | Seconds | Peak MB |
-|-----------------|--------:|--------:|--------:|
-| copy records    |       1 |   15.22 |       1 |
-| copy records    |       8 |    2.18 |      10 |
-| copy text       |       1 |   16.17 |       1 |
-| copy text       |       8 |    2.18 |      10 |
-| samtools sort   |       1 |   18.00 |     305 |
-| samtools sort   |       8 |    2.30 |     310 |
-| spillsort text  |       1 |   16.63 |     335 |
-| spillsort text  |       8 |    2.93 |     345 |
-| spillsort codec |       1 |   16.70 |     335 |
-| spillsort codec |       8 |    2.94 |     345 |
+| Method          | Threads | Seconds | Peak MB | Spilled MB |
+|-----------------|--------:|--------:|--------:|-----------:|
+| copy records    |       1 |   15.18 |       1 |          0 |
+| copy records    |       8 |    2.18 |      10 |          0 |
+| copy text       |       1 |   16.23 |       1 |          0 |
+| copy text       |       8 |    2.18 |      10 |          0 |
+| samtools sort   |       1 |   17.15 |     304 |         93 |
+| samtools sort   |       8 |    2.28 |     311 |         93 |
+| spillsort text  |       1 |   16.39 |     328 |        176 |
+| spillsort text  |       8 |    2.92 |     341 |        176 |
+| spillsort codec |       1 |   16.64 |     331 |        176 |
+| spillsort codec |       8 |    2.93 |     343 |        176 |
 
 And for 5 million records:
 
-| Method          | Threads | Seconds | Peak MB |
-|-----------------|--------:|--------:|--------:|
-| copy records    |       1 |   76.57 |       1 |
-| copy records    |       8 |   10.81 |      13 |
-| copy text       |       1 |   81.16 |       1 |
-| copy text       |       8 |   10.84 |      11 |
-| samtools sort   |       1 |   91.95 |     309 |
-| samtools sort   |       8 |   12.00 |     344 |
-| spillsort text  |       1 |   81.93 |     334 |
-| spillsort text  |       8 |   14.31 |     398 |
-| spillsort codec |       1 |   82.21 |     335 |
-| spillsort codec |       8 |   14.30 |     338 |
+| Method          | Threads | Seconds | Peak MB | Spilled MB |
+|-----------------|--------:|--------:|--------:|-----------:|
+| copy records    |       1 |   74.98 |       1 |          0 |
+| copy records    |       8 |   10.78 |      11 |          0 |
+| copy text       |       1 |   79.22 |       1 |          0 |
+| copy text       |       8 |   10.78 |      11 |          0 |
+| samtools sort   |       1 |   90.22 |     296 |        650 |
+| samtools sort   |       8 |   11.93 |     343 |        650 |
+| spillsort text  |       1 |   81.34 |     328 |        999 |
+| spillsort text  |       8 |   14.41 |     337 |        999 |
+| spillsort codec |       1 |   82.15 |     328 |        999 |
+| spillsort codec |       8 |   14.47 |     338 |        999 |
 
 On 8 threads, samtools sort takes little more than copying the records, and spillsort takes 20 to 30% longer than samtools sort.
-On 1 thread, compressing the output takes most of every method's time, and samtools sort is the slowest: it compresses each run it spills and decompresses it to merge, while spillsort spills runs uncompressed.
+On 1 thread, compressing the output takes most of every method's time, and samtools sort is the slowest: it compresses each run it spills with deflate and decompresses it to merge, while spillsort compresses its runs with LZ4, which is faster but writes 1.5 to 2 times as many bytes.
 Sorting with a key function and a codec takes as long as calling `add_encoded` in a Python loop.
-Both sorters peak 40 to 130 MB above the 268 MB (256 MiB) they were given, and the peak varies by tens of MB between runs.
+Both sorters peak 30 to 80 MB above the 268 MB (256 MiB) they were given, and the peak varies by tens of MB between runs.
 A Python program that makes or changes records would otherwise write them unsorted and sort them with samtools, paying for a copy and a sort; spillsort sorts them as they are written.
