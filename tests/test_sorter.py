@@ -84,6 +84,11 @@ def test_items_that_fit_in_memory_are_never_spilled(tmp_path: Path) -> None:
     assert list(sorter.sort()) == python_sorted(features(1_000), key=by_position)
 
 
+def test_the_key_function_can_be_given_by_name() -> None:
+    items = features(100)
+    assert list(Sorter(key=by_position).sort(items)) == python_sorted(items, key=by_position)
+
+
 def test_an_empty_sorter_reads_nothing() -> None:
     assert list(Sorter[int]().sort()) == []
     assert list(Sorter[int]().encoded()) == []

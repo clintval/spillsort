@@ -56,7 +56,6 @@ class Sorter(Generic[_T]):
     def __init__(
         self,
         key: Callable[[_T], SortKey] | None = None,
-        /,
         *,
         codec: Codec[_T] | None = None,
         max_bytes: int = 268_435_456,

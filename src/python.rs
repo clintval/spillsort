@@ -465,7 +465,7 @@ impl PySorter {
 #[pymethods]
 impl PySorter {
     #[new]
-    #[pyo3(signature = (key = None, /, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64, threads = 1))]
+    #[pyo3(signature = (key = None, *, codec = None, max_bytes = 268_435_456, tmp_dir = None, max_open = 64, threads = 1))]
     fn new(
         py: Python<'_>,
         key: Option<Bound<'_, PyAny>>,
