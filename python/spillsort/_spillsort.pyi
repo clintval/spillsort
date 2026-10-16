@@ -28,11 +28,12 @@ class Sorter(Generic[_T]):
     Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`, or
     by pickle, once, as it is added. Keys and bytes, and 16 bytes more for each item, are held in at
     most `max_bytes` of memory, unless one item alone needs more. Once half of that is full, a
-    background thread sorts it and writes it to a private directory in `tmp_dir` while the other
-    half fills. Sorting merges what was written with what is held, so items come out in key order,
-    and items with equal keys come out in the order they were added. A merge reads at most
-    `max_open` runs at once, each through a 256 KiB buffer and holding its next item, so it
-    takes about `max_open` times the largest item, plus those buffers, besides what is held.
+    background thread sorts it and writes it, compressed with LZ4, to a private directory in
+    `tmp_dir` while the other half fills. Sorting merges what was written with what is held, so
+    items come out in key order, and items with equal keys come out in the order they were
+    added. A merge reads at most `max_open` runs at once, each a block of up to 128 KiB at a
+    time, holding the block compressed and not, about 256 KiB, and its next item, so it takes
+    about `max_open` times the largest item, plus those blocks, besides what is held.
 
     The private directory is removed when reading ends, on `close()`, when a `with` block exits,
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
@@ -54,8 +55,8 @@ class Sorter(Generic[_T]):
         tmp_dir: The directory to spill into, which must be writable, or None for
             `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
-        threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
-            a pool of this sorter's own.
+        threads: The threads that sort each half and compress each run: with 1, the thread that
+            spills it, and with more, a pool of this sorter's own.
 
     Raises:
         TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.

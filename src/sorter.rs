@@ -185,13 +185,13 @@ impl Chunk {
         }
     }
 
-    /// The bytes this chunk takes once written as a run.
+    /// The bytes this chunk's records take in a run, before they are compressed.
     fn run_bytes(&self) -> u64 {
         (self.arena.len() + 8 * self.len()) as u64
     }
 
-    fn write_run(&self, path: PathBuf) -> io::Result<Run> {
-        let mut run = RunWriter::create(path)?;
+    fn write_run(&self, path: PathBuf, pool: Option<Arc<ThreadPool>>) -> io::Result<Run> {
+        let mut run = RunWriter::create(path, pool)?;
         for index in 0..self.len() {
             let (key, value) = self.record(index);
             run.push(key, value)?;
@@ -239,12 +239,13 @@ pub struct Config {
     /// temporary directory, which is `TMPDIR` on Unix.
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
-    /// into one first, as many times as it takes. A merge reads each run through a 256 KiB buffer,
-    /// holding its next record, so it takes about this many times the largest record, plus those
-    /// buffers.
+    /// into one first, as many times as it takes. A merge reads each run a block of up to 128 KiB
+    /// at a time, holding the block compressed and not, about 256 KiB, and its next record, so it
+    /// takes about this many times the largest record, plus those blocks.
     pub max_open: usize,
-    /// The threads that sort each chunk: with 1, the thread that sorts it, and with more, a pool
-    /// of this sorter's own.
+    /// The threads that sort each chunk and compress each run: with 1, the thread that spills it,
+    /// and with more, a pool of this sorter's own, which compresses two 128 KiB blocks for each
+    /// thread at a time.
     pub threads: usize,
 }
 
@@ -509,7 +510,7 @@ impl Sorter {
             .name("spillsort-spill".to_owned())
             .spawn(move || {
                 chunk.sort(pool.as_deref());
-                let written = chunk.write_run(path).map(|_| {
+                let written = chunk.write_run(path, pool).map(|_| {
                     chunk.clear(limit);
                     chunk
                 });
@@ -543,7 +544,7 @@ impl Sorter {
                 .collect::<io::Result<Vec<_>>>()?;
             let records = group.iter().map(|run| run.records).sum();
             let mut merged = Merged::new(sources, None, records)?;
-            let mut out = RunWriter::create(self.next_path()?)?;
+            let mut out = RunWriter::create(self.next_path()?, self.pool.clone())?;
             while let Some((key, value)) = merged.next_record()? {
                 out.push(key, value)?;
                 if out.records() % RECORDS_PER_ASK == 0 && stop() {
@@ -654,6 +655,62 @@ mod tests {
     }
 
     #[test]
+    fn sorts_stably_through_large_runs_and_merge_passes() {
+        let mut expected = Vec::new();
+        for index in 0u32..100_000 {
+            let key = index.wrapping_mul(2_654_435_761) % 5_000;
+            let value = format!("chr{}\t{key}\t{index}", index % 22);
+            expected.push((key.to_be_bytes().to_vec(), value.into_bytes()));
+        }
+        let mut sorted = expected.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for threads in [1, 4] {
+            let root = tempfile::tempdir().unwrap();
+            let config = config(1 << 20, 2, root.path()).threads(threads);
+            let mut sorter = Sorter::new(config).unwrap();
+            for (key, value) in &expected {
+                sorter.push(key, value).unwrap();
+            }
+            assert!(sorter.runs() > 4);
+            let mut merged = sorter.finish().unwrap();
+            assert_eq!(entries(root.path()), 1);
+            let records: Vec<_> = merged.by_ref().map(Result::unwrap).collect();
+            assert!(records == sorted, "{threads} threads");
+            assert_eq!(entries(root.path()), 0);
+        }
+    }
+
+    #[test]
+    fn sorts_records_larger_than_a_block_through_runs() {
+        let records: Vec<(u8, Vec<u8>)> = (0..24u8)
+            .map(|index| {
+                let length = (usize::from(index) * 37_000) % 400_000;
+                (index % 5, vec![index; length])
+            })
+            .collect();
+        let mut expected = records.clone();
+        expected.sort_by_key(|record| record.0);
+        for max_bytes in [2, 1 << 20] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sorter = Sorter::new(config(max_bytes, 3, root.path())).unwrap();
+            for (key, value) in &records {
+                sorter.push(&[*key], value).unwrap();
+            }
+            assert!(sorter.runs() > 3);
+            let sorted: Vec<(u8, Vec<u8>)> = sorter
+                .finish()
+                .unwrap()
+                .map(|record| {
+                    let (key, value) = record.unwrap();
+                    (key[0], value)
+                })
+                .collect();
+            assert!(sorted == expected, "max_bytes of {max_bytes}");
+            assert_eq!(entries(root.path()), 0);
+        }
+    }
+
+    #[test]
     fn merges_only_as_many_runs_as_are_too_many_to_open() {
         let root = tempfile::tempdir().unwrap();
         let mut sorter = Sorter::new(config(64, 64, root.path())).unwrap();
@@ -701,6 +758,25 @@ mod tests {
         let least = (sorter.limit - sorter.limit / 8) / (17 + ENTRY_BYTES);
         assert!(sorter.runs() > 2);
         assert!(sorter.runs.iter().all(|run| run.records as usize >= least));
+    }
+
+    #[test]
+    fn spills_runs_smaller_than_their_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 64, root.path())).unwrap();
+        for value in (0u32..100_000).rev() {
+            let line = format!("chr{}\t{value}\tread{value}\n", value % 22);
+            sorter.push(&value.to_be_bytes(), line.as_bytes()).unwrap();
+        }
+        sorter.wait().unwrap();
+        assert!(sorter.runs() > 2);
+        let records: u64 = sorter.runs.iter().map(|run| run.bytes).sum();
+        let on_disk: u64 = sorter
+            .runs
+            .iter()
+            .map(|run| fs::metadata(&run.path).unwrap().len())
+            .sum();
+        assert!(on_disk < records / 2, "{on_disk} of {records} bytes");
     }
 
     #[test]
@@ -837,23 +913,18 @@ mod tests {
     #[test]
     fn a_failed_merge_removes_its_runs_and_stops() {
         let root = tempfile::tempdir().unwrap();
-        let mut sorter = Sorter::new(config(128, 1_000, root.path())).unwrap();
-        for value in 0u32..200 {
-            sorter.push(&value.to_be_bytes(), b"value").unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 1_000, root.path())).unwrap();
+        for value in 0u32..20_000 {
+            sorter
+                .push(&value.to_be_bytes(), format!("{value:0100}").as_bytes())
+                .unwrap();
         }
         sorter.wait().unwrap();
-        let dir = fs::read_dir(root.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let record = 4 + 4 + 4 + b"value".len();
-        for run in fs::read_dir(&dir).unwrap() {
-            let run = run.unwrap().path();
-            let bytes = fs::read(&run).unwrap();
-            assert_eq!(bytes.len(), 2 * record);
-            fs::write(&run, &bytes[..record + 3]).unwrap();
+        assert!(sorter.runs() > 2);
+        for run in &sorter.runs {
+            assert!(run.bytes > 2 * (128 << 10), "{run:?} has a single block");
+            let bytes = fs::read(&run.path).unwrap();
+            fs::write(&run.path, &bytes[..bytes.len() - 3]).unwrap();
         }
         let mut merged = sorter.finish().unwrap();
         let error = loop {
