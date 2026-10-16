@@ -48,7 +48,8 @@ T = TypeVar("T")
 
 
 def add_all(sorter: Sorter[T], items: Iterable[T]) -> None:
-    sorter.add(*items)
+    for item in items:
+        sorter.add(item)
 
 
 @settings(
@@ -88,29 +89,6 @@ def test_items_that_fit_in_memory_are_never_spilled(tmp_path: Path) -> None:
 def test_the_key_function_can_be_given_by_name() -> None:
     items = features(100)
     assert list(Sorter(key=by_position).sort(items)) == python_sorted(items, key=by_position)
-
-
-def test_adding_takes_any_number_of_items_in_order(tmp_path: Path) -> None:
-    sorter = Sorter(itemgetter(0), max_bytes=256, tmp_dir=tmp_path)
-    sorter.add()
-    assert len(sorter) == 0
-    sorter.add((1, "a"))
-    sorter.add((0, "b"), (1, "c"), (0, "d"))
-    assert len(sorter) == 4
-    assert list(sorter.sort()) == [(0, "b"), (0, "d"), (1, "a"), (1, "c")]
-
-
-def test_adding_several_items_keeps_those_before_one_that_fails() -> None:
-    def key(item: int) -> SortKey:
-        if item == 3:
-            raise KeyError(item)
-        return -item
-
-    sorter = Sorter(key)
-    with pytest.raises(KeyError):
-        sorter.add(*range(10))
-    assert len(sorter) == 3
-    assert list(sorter.sort()) == [2, 1, 0]
 
 
 def test_an_empty_sorter_reads_nothing() -> None:
@@ -284,7 +262,6 @@ def test_a_closed_sorter_refuses_everything(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
     assert len(sorter) == 100
     actions: list[Callable[[], object]] = [
-        sorter.add,
         lambda: sorter.add(1),
         lambda: sorter.add_encoded(1, b""),
         sorter.sort,

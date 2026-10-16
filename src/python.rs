@@ -574,23 +574,16 @@ impl PySorter {
         })
     }
 
-    /// Add each item given, in order, keyed and encoded now; with none, add nothing.
-    ///
-    /// Items given before one that fails stay added.
+    /// Add an item, keyed and encoded now.
     ///
     /// Raises:
-    ///     TypeError: If a key is not a sort key, or the codec does not return bytes.
+    ///     TypeError: If the key is not a sort key, or the codec does not return bytes.
     ///     ValueError: If the sorter is closed.
     ///     RuntimeError: If the sorter has been read, or an earlier error lost items.
     ///     OSError: If spilling to disk fails.
-    #[pyo3(signature = (*items))]
-    fn add(&self, py: Python<'_>, items: &Bound<'_, PyTuple>) -> PyResult<()> {
+    fn add(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<()> {
         self.check_adding()?;
-        let mut key = Vec::with_capacity(64);
-        for item in items {
-            self.push_item(py, &item, &mut key)?;
-        }
-        Ok(())
+        self.push_item(py, item, &mut Vec::with_capacity(64))
     }
 
     /// Add bytes that the codec would decode, with their sort key, calling neither.
