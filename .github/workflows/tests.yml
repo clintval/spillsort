@@ -127,7 +127,7 @@ jobs:
 
       - name: Check that the interpreter is free-threaded
         if: ${{ endsWith(matrix.python-version, 't') }}
-        run: uv run --locked python -c "import sysconfig; assert sysconfig.get_config_var('Py_GIL_DISABLED')"
+        run: uv run --locked --no-group benchmark python -c "import sysconfig; assert sysconfig.get_config_var('Py_GIL_DISABLED')"
 
       - name: Test the library
-        run: uv run --locked poe check-tests
+        run: uv run --locked --no-group benchmark poe check-tests
