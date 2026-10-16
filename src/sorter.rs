@@ -245,9 +245,10 @@ pub struct Config {
     /// record, so it takes about this many times the largest record, plus those blocks.
     pub max_open: usize,
     /// The threads that sort each chunk and compress each run: with 1, the thread that spills it,
-    /// and with more, a pool of this sorter's own. Writing a run holds a 128 KiB block and room
-    /// for it compressed, about 269 KiB, beyond `max_bytes`, for each block compressed at once:
-    /// one with 1 thread, and with more, two for each thread, but at most 16, about 4.2 MiB.
+    /// and with more, a pool of this sorter's own. Writing a run holds, beyond `max_bytes`, a 1 MiB
+    /// buffer of what it writes and, for each block compressed at once, a 128 KiB block and room
+    /// for it compressed, about 269 KiB: one block with 1 thread, and with more, two for each
+    /// thread, but at most 16, about 4.2 MiB.
     pub threads: usize,
 }
 
