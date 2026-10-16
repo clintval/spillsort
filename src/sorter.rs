@@ -190,8 +190,8 @@ impl Chunk {
         (self.arena.len() + 8 * self.len()) as u64
     }
 
-    fn write_run(&self, path: PathBuf) -> io::Result<Run> {
-        let mut run = RunWriter::create(path)?;
+    fn write_run(&self, path: PathBuf, pool: Option<Arc<ThreadPool>>) -> io::Result<Run> {
+        let mut run = RunWriter::create(path, pool)?;
         for index in 0..self.len() {
             let (key, value) = self.record(index);
             run.push(key, value)?;
@@ -243,8 +243,9 @@ pub struct Config {
     /// at a time, holding the block compressed and not, about 256 KiB, and its next record, so it
     /// takes about this many times the largest record, plus those blocks.
     pub max_open: usize,
-    /// The threads that sort each chunk: with 1, the thread that sorts it, and with more, a pool
-    /// of this sorter's own.
+    /// The threads that sort each chunk and compress each run: with 1, the thread that spills it,
+    /// and with more, a pool of this sorter's own, which compresses two 128 KiB blocks for each
+    /// thread at a time.
     pub threads: usize,
 }
 
@@ -509,7 +510,7 @@ impl Sorter {
             .name("spillsort-spill".to_owned())
             .spawn(move || {
                 chunk.sort(pool.as_deref());
-                let written = chunk.write_run(path).map(|_| {
+                let written = chunk.write_run(path, pool).map(|_| {
                     chunk.clear(limit);
                     chunk
                 });
@@ -543,7 +544,7 @@ impl Sorter {
                 .collect::<io::Result<Vec<_>>>()?;
             let records = group.iter().map(|run| run.records).sum();
             let mut merged = Merged::new(sources, None, records)?;
-            let mut out = RunWriter::create(self.next_path()?)?;
+            let mut out = RunWriter::create(self.next_path()?, self.pool.clone())?;
             while let Some((key, value)) = merged.next_record()? {
                 out.push(key, value)?;
                 if out.records() % RECORDS_PER_ASK == 0 && stop() {
@@ -655,24 +656,28 @@ mod tests {
 
     #[test]
     fn sorts_stably_through_large_runs_and_merge_passes() {
-        let root = tempfile::tempdir().unwrap();
-        let mut sorter = Sorter::new(config(1 << 20, 2, root.path())).unwrap();
         let mut expected = Vec::new();
         for index in 0u32..100_000 {
             let key = index.wrapping_mul(2_654_435_761) % 5_000;
             let value = format!("chr{}\t{key}\t{index}", index % 22);
-            sorter.push(&key.to_be_bytes(), value.as_bytes()).unwrap();
             expected.push((key.to_be_bytes().to_vec(), value.into_bytes()));
         }
-        assert!(sorter.runs() > 4);
-        let mut merged = sorter.finish().unwrap();
-        assert_eq!(entries(root.path()), 1);
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            merged.by_ref().map(Result::unwrap).collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(entries(root.path()), 0);
+        let mut sorted = expected.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for threads in [1, 4] {
+            let root = tempfile::tempdir().unwrap();
+            let config = config(1 << 20, 2, root.path()).threads(threads);
+            let mut sorter = Sorter::new(config).unwrap();
+            for (key, value) in &expected {
+                sorter.push(key, value).unwrap();
+            }
+            assert!(sorter.runs() > 4);
+            let mut merged = sorter.finish().unwrap();
+            assert_eq!(entries(root.path()), 1);
+            let records: Vec<_> = merged.by_ref().map(Result::unwrap).collect();
+            assert!(records == sorted, "{threads} threads");
+            assert_eq!(entries(root.path()), 0);
+        }
     }
 
     #[test]

@@ -6,8 +6,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
+use rayon::ThreadPool;
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
 /// The most bytes of records a block holds.
 const BLOCK: usize = 128 << 10;
@@ -36,28 +39,57 @@ fn corrupt(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-/// Writes records to a new run, in the order given, a compressed block at a time.
+/// A block of records, and the room to compress it into after its lengths.
+#[derive(Default)]
+struct Block {
+    records: Vec<u8>,
+    compressed: Vec<u8>,
+    written: usize,
+}
+
+impl Block {
+    fn compress(&mut self) -> io::Result<()> {
+        let most = HEADER + get_maximum_output_size(self.records.len());
+        if self.compressed.len() < most {
+            self.compressed.resize(most, 0);
+        }
+        let (header, payload) = self.compressed.split_at_mut(HEADER);
+        let size = compress_into(&self.records, payload).map_err(io::Error::other)?;
+        header[..4].copy_from_slice(&(size as u32).to_le_bytes());
+        header[4..].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
+        self.written = HEADER + size;
+        Ok(())
+    }
+}
+
+/// Writes records to a new run, in the order given, a compressed block at a time, or, given a
+/// pool, compressing two blocks for each of its threads at once.
 pub(crate) struct RunWriter {
     file: File,
     path: PathBuf,
-    block: Vec<u8>,
-    compressed: Vec<u8>,
+    pool: Option<Arc<ThreadPool>>,
+    blocks: Vec<Block>,
+    filling: usize,
     records: u64,
     bytes: u64,
 }
 
 impl RunWriter {
-    pub fn create(path: PathBuf) -> io::Result<Self> {
+    pub fn create(path: PathBuf, pool: Option<Arc<ThreadPool>>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|error| with_path(&error, &path))?;
+        let blocks = pool
+            .as_ref()
+            .map_or(1, |pool| 2 * pool.current_num_threads());
         Ok(RunWriter {
             file,
             path,
-            block: Vec::with_capacity(BLOCK),
-            compressed: Vec::new(),
+            pool,
+            blocks: (0..blocks).map(|_| Block::default()).collect(),
+            filling: 0,
             records: 0,
             bytes: 0,
         })
@@ -82,7 +114,7 @@ impl RunWriter {
     }
 
     pub fn finish(mut self) -> io::Result<Run> {
-        self.write_block()
+        self.write_blocks()
             .map_err(|error| with_path(&error, &self.path))?;
         Ok(Run {
             path: self.path,
@@ -91,34 +123,45 @@ impl RunWriter {
         })
     }
 
-    /// Adds bytes to the block, writing it each time it fills.
+    /// Adds bytes to the blocks, writing them each time they are all full.
     fn write_bytes(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
-            let taken = bytes.len().min(BLOCK - self.block.len());
-            self.block.extend_from_slice(&bytes[..taken]);
+            let block = &mut self.blocks[self.filling].records;
+            if block.capacity() == 0 {
+                block.reserve_exact(BLOCK);
+            }
+            let taken = bytes.len().min(BLOCK - block.len());
+            block.extend_from_slice(&bytes[..taken]);
             bytes = &bytes[taken..];
-            if self.block.len() == BLOCK {
-                self.write_block()?;
+            if block.len() == BLOCK {
+                self.filling += 1;
+                if self.filling == self.blocks.len() {
+                    self.write_blocks()?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Compresses the block, if it holds anything, and writes it after its lengths.
-    fn write_block(&mut self) -> io::Result<()> {
-        if self.block.is_empty() {
-            return Ok(());
+    /// Compresses the blocks that hold records, on the pool if there is one, and writes them.
+    fn write_blocks(&mut self) -> io::Result<()> {
+        let filled = self
+            .blocks
+            .iter()
+            .take_while(|block| !block.records.is_empty())
+            .count();
+        let blocks = &mut self.blocks[..filled];
+        match &self.pool {
+            Some(pool) if filled > 1 => {
+                pool.install(|| blocks.par_iter_mut().try_for_each(Block::compress))?;
+            }
+            _ => blocks.iter_mut().try_for_each(Block::compress)?,
         }
-        let most = HEADER + get_maximum_output_size(self.block.len());
-        if self.compressed.len() < most {
-            self.compressed.resize(most, 0);
+        for block in blocks {
+            self.file.write_all(&block.compressed[..block.written])?;
+            block.records.clear();
         }
-        let (header, payload) = self.compressed.split_at_mut(HEADER);
-        let size = compress_into(&self.block, payload).map_err(io::Error::other)?;
-        header[..4].copy_from_slice(&(size as u32).to_le_bytes());
-        header[4..].copy_from_slice(&(self.block.len() as u32).to_le_bytes());
-        self.file.write_all(&self.compressed[..HEADER + size])?;
-        self.block.clear();
+        self.filling = 0;
         Ok(())
     }
 }
@@ -237,7 +280,7 @@ mod tests {
     use super::*;
 
     fn write(path: PathBuf, records: &[(&[u8], &[u8])]) -> Run {
-        let mut writer = RunWriter::create(path).unwrap();
+        let mut writer = RunWriter::create(path, None).unwrap();
         for (key, value) in records {
             writer.push(key, value).unwrap();
         }
@@ -274,7 +317,7 @@ mod tests {
 
     /// A run of many records, spanning several blocks.
     fn long_run(path: PathBuf) -> Run {
-        let mut writer = RunWriter::create(path).unwrap();
+        let mut writer = RunWriter::create(path, None).unwrap();
         for index in 0u32..50_000 {
             let value = format!("chr{}\t{index}\tread{index}\n", index % 22);
             writer.push(&index.to_be_bytes(), value.as_bytes()).unwrap();
@@ -337,6 +380,27 @@ mod tests {
         let records = read(&run).unwrap();
         assert_eq!(records.len(), 50_000);
         assert_eq!(records[49_999].1, b"chr15\t49999\tread49999\n");
+    }
+
+    #[test]
+    fn a_pool_compresses_the_same_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let alone = long_run(dir.path().join("alone"));
+        let mut writer =
+            RunWriter::create(dir.path().join("pooled"), Some(Arc::new(pool))).unwrap();
+        assert_eq!(writer.blocks.len(), 6);
+        for (key, value) in read(&alone).unwrap() {
+            writer.push(&key, &value).unwrap();
+        }
+        let pooled = writer.finish().unwrap();
+        assert_eq!((pooled.records, pooled.bytes), (alone.records, alone.bytes));
+        let bytes = fs::read(&pooled.path).unwrap();
+        assert!(block_offsets(&bytes).len() > 6);
+        assert_eq!(bytes, fs::read(&alone.path).unwrap());
     }
 
     #[test]
@@ -431,7 +495,7 @@ mod tests {
     #[test]
     fn a_length_past_the_end_of_a_run_is_corrupt_and_allocates_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = RunWriter::create(dir.path().join("run")).unwrap();
+        let mut writer = RunWriter::create(dir.path().join("run"), None).unwrap();
         writer.write_bytes(&u32::MAX.to_le_bytes()).unwrap();
         writer.write_bytes(&[7; 100]).unwrap();
         let run = Run {
@@ -464,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run");
         write(path.clone(), &[]);
-        let error = RunWriter::create(path).map(|_| ()).unwrap_err();
+        let error = RunWriter::create(path, None).map(|_| ()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 }

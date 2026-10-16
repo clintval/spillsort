@@ -55,8 +55,8 @@ class Sorter(Generic[_T]):
         tmp_dir: The directory to spill into, which must be writable, or None for
             `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
-        threads: The threads that sort each half: with 1, the thread that sorts it, and with more,
-            a pool of this sorter's own.
+        threads: The threads that sort each half and compress each run: with 1, the thread that
+            spills it, and with more, a pool of this sorter's own.
 
     Raises:
         TypeError: If `key` is not callable, or `codec` lacks `encode` and `decode` methods.
