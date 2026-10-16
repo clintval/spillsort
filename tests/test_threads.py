@@ -3,7 +3,9 @@
 import faulthandler
 import functools
 import pickle
+import sys
 import threading
+import time
 from collections.abc import Callable
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,6 +13,8 @@ from pathlib import Path
 import pytest
 from spillsort import Sorter
 from typing_extensions import override
+
+from tests.helpers import spilled
 
 THREADS = 8
 TIMEOUT = 60.0
@@ -127,3 +131,32 @@ def test_closing_while_threads_add_refuses_the_rest_and_removes_files(tmp_path: 
     closer.finish()
     assert all(count < 1_000_000 for count in added)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_dropping_a_sorter_lets_other_threads_run(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=1_024, tmp_dir=tmp_path)
+    for value in range(20_000):
+        sorter.add(value)
+    assert len(spilled(tmp_path)) > 500
+    stamps: list[float] = []
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.is_set():
+            stamps.append(time.perf_counter())
+            time.sleep(0.0001)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(TIMEOUT)
+    ticker = Worker(tick)
+    try:
+        time.sleep(0.01)
+        start = time.perf_counter()
+        del sorter
+        end = time.perf_counter()
+    finally:
+        stop.set()
+        sys.setswitchinterval(interval)
+    ticker.finish()
+    assert list(tmp_path.iterdir()) == []
+    assert any(start < stamp < end for stamp in stamps)

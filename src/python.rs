@@ -701,6 +701,25 @@ impl PySorter {
     }
 }
 
+impl Drop for PySorter {
+    fn drop(&mut self) {
+        release(&mut self.state);
+    }
+}
+
+/// Drops a sorter's state once nothing else shares it, without the GIL if it is attached, since
+/// waiting for a spill and removing what was spilled can take a while.
+fn release(state: &mut Arc<Lock<State>>) {
+    let Some(lock) = Arc::get_mut(state) else {
+        return;
+    };
+    let inner = lock.mutex.get_mut().unwrap_or_else(PoisonError::into_inner);
+    let state = mem::replace(inner, State::Closed);
+    if matches!(state, State::Adding(_) | State::Reading(..)) {
+        Python::try_attach(|py| py.detach(move || drop(state)));
+    }
+}
+
 /// Writes all of `data` to a handle, again after a short write.
 fn write_all(write: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<()> {
     let mut rest = data;
@@ -785,6 +804,12 @@ impl SortedIterator {
             visit.call(decode)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for SortedIterator {
+    fn drop(&mut self) {
+        release(&mut self.state);
     }
 }
 
