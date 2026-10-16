@@ -10,6 +10,7 @@ use spillsort::key;
 enum Value {
     None,
     Int(i128),
+    UInt(u128),
     BigInt(bool, Vec<u8>),
     Float(f64),
     Str(String),
@@ -22,6 +23,7 @@ fn encode(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::None => key::push_none(out),
         Value::Int(int) => key::push_int(out, *int),
+        Value::UInt(uint) => key::push_uint(out, *uint),
         Value::BigInt(negative, magnitude) => key::push_big_int(out, *negative, magnitude),
         Value::Float(float) => key::push_float(out, *float),
         Value::Str(text) => key::push_str(out, text),
@@ -52,6 +54,7 @@ fn number(value: &Value) -> Option<Number> {
             *int < 0,
             int.unsigned_abs().to_be_bytes().to_vec(),
         )),
+        Value::UInt(uint) => Some(Number::Int(false, uint.to_be_bytes().to_vec())),
         Value::BigInt(negative, magnitude) => Some(Number::Int(*negative, magnitude.clone())),
         Value::Float(float) => Some(Number::Float(*float)),
         _ => None,

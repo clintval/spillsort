@@ -61,6 +61,25 @@ pub fn push_int(out: &mut Vec<u8>, value: impl Into<i128>) {
     push_number(out, floor, &excess.to_be_bytes());
 }
 
+/// Push an unsigned int, such as a position, which compares with other ints and floats as
+/// [`push_int`]'s do. A `usize` converts to a `u64` without loss.
+///
+/// ```
+/// use spillsort::key;
+///
+/// let (mut position, mut int) = (Vec::new(), Vec::new());
+/// key::push_uint(&mut position, 900usize as u64);
+/// key::push_int(&mut int, 900);
+/// assert_eq!(position, int);
+/// ```
+pub fn push_uint(out: &mut Vec<u8>, value: impl Into<u128>) {
+    let value = value.into();
+    match i128::try_from(value) {
+        Ok(value) => push_int(out, value),
+        Err(_) => push_big_int(out, false, &value.to_be_bytes()),
+    }
+}
+
 /// Push an int of any size, given its sign and its magnitude as big-endian bytes.
 #[allow(clippy::cast_precision_loss)]
 pub fn push_big_int(out: &mut Vec<u8>, negative: bool, magnitude: &[u8]) {
@@ -279,6 +298,12 @@ mod tests {
         out
     }
 
+    fn uint(value: u128) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_uint(&mut out, value);
+        out
+    }
+
     fn big(negative: bool, magnitude: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         push_big_int(&mut out, negative, magnitude);
@@ -429,6 +454,34 @@ mod tests {
         #[test]
         fn ints_order_as_numbers(a in any::<i128>(), b in any::<i128>()) {
             prop_assert_eq!(int(a).cmp(&int(b)), a.cmp(&b));
+        }
+
+        #[test]
+        fn uints_order_as_numbers_and_against_ints(a in any::<u128>(), b in any::<u128>(), c in any::<i128>()) {
+            prop_assert_eq!(uint(a).cmp(&uint(b)), a.cmp(&b));
+            let against_int = u128::try_from(c).map_or(Greater, |c| a.cmp(&c));
+            prop_assert_eq!(uint(a).cmp(&int(c)), against_int);
+        }
+
+        #[test]
+        fn uints_that_fit_in_an_i128_encode_as_ints(value in 0..=i128::MAX) {
+            prop_assert_eq!(uint(value as u128), int(value));
+        }
+
+        #[test]
+        fn uints_and_floats_compare_exactly(
+            a in prop_oneof![
+                any::<u128>(),
+                any::<u64>().prop_map(u128::from),
+                (i128::MAX as u128 - 1_000)..=(i128::MAX as u128 + 1_000),
+            ],
+            b in integral_float_strategy(),
+        ) {
+            let python = match i128::try_from(a) {
+                Ok(a) => compare_int_float(a, b),
+                Err(_) => compare_big_float(false, &a.to_be_bytes(), b),
+            };
+            prop_assert_eq!(uint(a).cmp(&float(b)), python);
         }
 
         #[test]
