@@ -1,10 +1,11 @@
 //! Sort more records than fit in memory: sorted runs spill to disk and merge as they are read.
 //!
 //! A record is a key and a value, both bytes. Records sort by key, compared as bytes, and records
-//! with equal keys come out in the order they were pushed. A [`Sorter`] holds up to
-//! [`Config::max_bytes`] of records in memory. Once half of that fills, a background thread sorts
-//! it on every core and writes it to a temporary file, a run, while the other half fills.
-//! [`Sorter::finish`] merges the runs with the records still held and returns them in order.
+//! with equal keys come out in the order they were pushed. A [`Sorter`] holds at most
+//! [`Config::max_bytes`] of records in memory. Once half of that is full, a background thread
+//! sorts it, on a pool of [`Config::threads`] threads if there are more than one, and writes it to
+//! a temporary file, a run, while the other half fills. [`Sorter::finish`] merges the runs with
+//! the records still held and returns them in order.
 //!
 //! The [`key`] module builds keys from numbers, text, bytes, and tuples of them, and their bytes
 //! compare as those values do in Python. A key built from several fields sorts field by field.

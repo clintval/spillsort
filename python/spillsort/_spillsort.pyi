@@ -26,11 +26,12 @@ class _Writable(Protocol):
 class Sorter(Generic[_T]):
     """Sort more items than fit in memory: add them, then sort them once.
 
-    Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`,
-    or by pickle, once, as it is added. Keys and bytes are held in up to `max_bytes` of memory.
-    Once half of that fills, a background thread sorts it and writes it to a private directory in
-    `tmp_dir` while the other half fills. Sorting merges what was written with what is held, so
-    items come out in key order, and items with equal keys come out in the order they were added.
+    Each item is turned into a sort key by `key`, or is its own key, and into bytes by `codec`, or
+    by pickle, once, as it is added. Keys and bytes, and 16 bytes more for each item, are held in at
+    most `max_bytes` of memory, unless one item alone needs more. Once half of that is full, a
+    background thread sorts it and writes it to a private directory in `tmp_dir` while the other
+    half fills. Sorting merges what was written with what is held, so items come out in key order,
+    and items with equal keys come out in the order they were added.
 
     The private directory is removed when reading ends, on `close()`, when a `with` block exits,
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
@@ -41,7 +42,8 @@ class Sorter(Generic[_T]):
             tuple or list of them, compared as Python compares them. None sorts items by
             themselves.
         codec: Encodes each item into bytes and decodes it back; pickle if None.
-        max_bytes: The most bytes of keys and encoded items to hold in memory, at least 2.
+        max_bytes: The most memory to hold keys and encoded items in, counting 16 bytes more for
+            each, at least 2.
         tmp_dir: The directory to spill into, or None for `tempfile.gettempdir()`.
         max_open: The most spilled runs to merge at once, at least 2; more are merged in passes.
         threads: The threads that sort each half: with 1, the thread that sorts it, and with more,

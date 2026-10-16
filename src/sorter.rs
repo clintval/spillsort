@@ -15,7 +15,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
 use crate::merge::{Merged, Source};
-use crate::run::{Run, RunReader, RunWriter, record_bytes};
+use crate::run::{Run, RunReader, RunWriter};
 use crate::{Error, Result};
 
 /// The default for [`Config::max_bytes`]: 256 MiB.
@@ -39,11 +39,24 @@ const ENTRY_BYTES: usize = mem::size_of::<Entry>();
 /// The least capacity a chunk's arena grows to, unless the memory limit is smaller.
 const MIN_ARENA: usize = 64 << 10;
 
+/// The fewest records a chunk makes room for, unless the memory limit is smaller.
+const MIN_ENTRIES: usize = 1 << 10;
+
 #[derive(Clone, Copy)]
 struct Entry {
     offset: usize,
     key_len: u32,
     value_len: u32,
+}
+
+/// How a chunk makes room for one more record.
+enum Room {
+    /// It has room already.
+    Ready,
+    /// It has room once its arena and its entries have these capacities.
+    Resize { arena: usize, entries: usize },
+    /// It is full, so it must be spilled first.
+    Full,
 }
 
 /// Records held in memory, their keys and values side by side in one arena.
@@ -54,9 +67,9 @@ pub(crate) struct Chunk {
 }
 
 impl Chunk {
-    /// The bytes this chunk holds: its keys, its values, and the place of each record.
-    fn bytes(&self) -> usize {
-        self.arena.len() + self.entries.len() * ENTRY_BYTES
+    /// The bytes this chunk has allocated: for keys and values, and for the place of each record.
+    fn capacity_bytes(&self) -> usize {
+        self.arena.capacity() + self.entries.capacity() * ENTRY_BYTES
     }
 
     pub fn len(&self) -> usize {
@@ -67,15 +80,66 @@ impl Chunk {
         self.entries.is_empty()
     }
 
-    /// Adds a record, growing the arena geometrically but never past `limit` unless one record
-    /// needs more.
-    fn push(&mut self, key: &[u8], value: &[u8], limit: usize) {
-        let needed = self.arena.len() + key.len() + value.len();
-        if needed > self.arena.capacity() {
-            let grown = (self.arena.capacity() * 2).max(MIN_ARENA).min(limit);
-            self.arena
-                .reserve_exact(grown.max(needed) - self.arena.len());
+    /// How to make room for a record of `bytes` bytes without allocating more than `limit`: by
+    /// doubling what is short, or, once that would not fit, by sharing `limit` in proportion to
+    /// what each part holds, unless the chunk is nearly full. An empty chunk always takes one
+    /// record, however large, and a chunk holding one larger than `limit` takes no more.
+    fn room(&self, bytes: usize, limit: usize) -> Room {
+        let arena = self.arena.len() + bytes;
+        let entries = self.entries.len() + 1;
+        let oversized = self.capacity_bytes() > limit && !self.is_empty();
+        if arena <= self.arena.capacity() && entries <= self.entries.capacity() && !oversized {
+            return Room::Ready;
         }
+        let grown = |needed: usize, capacity: usize, least: usize| {
+            if needed > capacity {
+                (capacity * 2).max(least).max(needed)
+            } else {
+                capacity
+            }
+        };
+        let doubled = (
+            grown(arena, self.arena.capacity(), MIN_ARENA),
+            grown(entries, self.entries.capacity(), MIN_ENTRIES),
+        );
+        if doubled.0 + doubled.1 * ENTRY_BYTES <= limit {
+            return Room::Resize {
+                arena: doubled.0,
+                entries: doubled.1,
+            };
+        }
+        if self.is_empty() {
+            return Room::Resize {
+                arena: arena.max(self.arena.capacity()),
+                entries: entries.max(self.entries.capacity()),
+            };
+        }
+        let used = arena + entries * ENTRY_BYTES;
+        if used > limit - limit / 8 {
+            return Room::Full;
+        }
+        let shared = (arena as u128 * limit as u128 / used as u128) as usize;
+        Room::Resize {
+            arena: shared,
+            entries: (limit - shared) / ENTRY_BYTES,
+        }
+    }
+
+    /// Makes room for a record of `bytes` bytes within `limit`, or returns false if it is full.
+    fn make_room(&mut self, bytes: usize, limit: usize) -> bool {
+        match self.room(bytes, limit) {
+            Room::Ready => true,
+            Room::Resize { arena, entries } => {
+                resize(&mut self.arena, arena);
+                resize(&mut self.entries, entries);
+                true
+            }
+            Room::Full => false,
+        }
+    }
+
+    /// Adds a record, in the room made for it.
+    fn push(&mut self, key: &[u8], value: &[u8]) {
         self.entries.push(Entry {
             offset: self.arena.len(),
             key_len: key.len() as u32,
@@ -94,26 +158,28 @@ impl Chunk {
         )
     }
 
-    /// Sorts by key, on a pool's threads if given, keeping records with equal keys in the order
-    /// pushed.
+    /// Sorts by key, on a pool's threads if given, in place, keeping records with equal keys in
+    /// the order pushed: those come in the order of their offsets, and of an empty record and the
+    /// record pushed after it at the same offset, the empty one has the shorter value.
     fn sort(&mut self, pool: Option<&ThreadPool>) {
         let arena = &self.arena;
         let entries = &mut self.entries;
         let key = |entry: &Entry| &arena[entry.offset..entry.offset + entry.key_len as usize];
+        let order = |a: &Entry, b: &Entry| {
+            key(a)
+                .cmp(key(b))
+                .then(a.offset.cmp(&b.offset))
+                .then(a.value_len.cmp(&b.value_len))
+        };
         match pool {
-            Some(pool) => pool.install(|| entries.par_sort_by(|a, b| key(a).cmp(key(b)))),
-            None => entries.sort_by(|a, b| key(a).cmp(key(b))),
+            Some(pool) => pool.install(|| entries.par_sort_unstable_by(order)),
+            None => entries.sort_unstable_by(order),
         }
     }
 
     /// The bytes this chunk takes once written as a run.
     fn run_bytes(&self) -> u64 {
-        (0..self.len())
-            .map(|index| {
-                let (key, value) = self.record(index);
-                record_bytes(key, value)
-            })
-            .sum()
+        (self.arena.len() + 8 * self.len()) as u64
     }
 
     fn write_run(&self, path: PathBuf) -> io::Result<Run> {
@@ -125,9 +191,23 @@ impl Chunk {
         run.finish()
     }
 
-    fn clear(&mut self) {
+    /// Empties the chunk, keeping what it allocated to fill again unless that is more than
+    /// `limit`.
+    fn clear(&mut self, limit: usize) {
+        if self.capacity_bytes() > limit {
+            *self = Chunk::default();
+        }
         self.arena.clear();
         self.entries.clear();
+    }
+}
+
+/// Grows or shrinks a vector to hold exactly `capacity` items, or its length if that is more.
+fn resize<T>(vector: &mut Vec<T>, capacity: usize) {
+    if capacity > vector.capacity() {
+        vector.reserve_exact(capacity - vector.len());
+    } else if capacity < vector.capacity() {
+        vector.shrink_to(capacity);
     }
 }
 
@@ -143,8 +223,9 @@ impl Chunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {
-    /// The most bytes of records to hold in memory, counting each record's key and value and 16
-    /// bytes for its place. Half fills while the other half is sorted and spilled.
+    /// The most memory to hold records in, counting what is allocated for their keys and values
+    /// and 16 bytes for the place of each. Half fills while the other half is sorted, in place,
+    /// and spilled, so neither holds more than half of this, unless one record alone needs more.
     pub max_bytes: usize,
     /// The directory in which a private directory of runs is made, or None for the system's
     /// temporary directory, which is `TMPDIR` on Unix.
@@ -289,8 +370,8 @@ impl Sorter {
         self.runs.len()
     }
 
-    /// Adds a record. Once half of `max_bytes` is held, it is spilled in the background, after
-    /// waiting for the spill before it to finish.
+    /// Adds a record. When the half of `max_bytes` that fills has no room left for it, that half
+    /// is spilled in the background first, after waiting for the spill before it to finish.
     pub fn push(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.failed {
             return Err(Error::Failed);
@@ -300,18 +381,19 @@ impl Sorter {
                 "a key or value must be shorter than 4 GiB".to_owned(),
             ));
         }
-        self.chunk.push(key, value, self.limit);
-        self.count += 1;
-        if self.chunk.bytes() >= self.limit {
+        if !self.chunk.make_room(key.len() + value.len(), self.limit) {
             self.spill().inspect_err(|_| self.failed = true)?;
+            self.chunk.make_room(key.len() + value.len(), self.limit);
         }
+        self.chunk.push(key, value);
+        self.count += 1;
         Ok(())
     }
 
     /// Returns true if pushing a record of this many bytes would spill, and so might wait.
     #[cfg(feature = "python")]
     pub(crate) fn would_spill(&self, bytes: usize) -> bool {
-        self.chunk.bytes() + bytes + ENTRY_BYTES >= self.limit
+        matches!(self.chunk.room(bytes, self.limit), Room::Full)
     }
 
     /// Stops adding and returns every record, merged in order.
@@ -373,13 +455,13 @@ impl Sorter {
             records: chunk.len() as u64,
             bytes: chunk.run_bytes(),
         });
-        let pool = self.pool.clone();
+        let (pool, limit) = (self.pool.clone(), self.limit);
         let handle = thread::Builder::new()
             .name("spillsort-spill".to_owned())
             .spawn(move || {
                 chunk.sort(pool.as_deref());
                 chunk.write_run(path)?;
-                chunk.clear();
+                chunk.clear(limit);
                 Ok(chunk)
             })?;
         self.pending = Some(handle);
@@ -539,6 +621,58 @@ mod tests {
     }
 
     #[test]
+    fn allocates_no_more_than_max_bytes_however_small_the_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 64, root.path())).unwrap();
+        for value in 0u64..200_000 {
+            sorter
+                .push(&value.to_be_bytes(), &[value as u8; 9])
+                .unwrap();
+            let spare = sorter.spare.as_ref().map_or(0, Chunk::capacity_bytes);
+            assert!(sorter.chunk.capacity_bytes() <= sorter.limit);
+            assert!(spare <= sorter.limit);
+        }
+        sorter.wait().unwrap();
+        let least = (sorter.limit - sorter.limit / 8) / (17 + ENTRY_BYTES);
+        assert!(sorter.runs() > 2);
+        assert!(sorter.runs.iter().all(|run| run.records as usize >= least));
+    }
+
+    #[test]
+    fn keeps_records_with_equal_keys_in_order_even_when_empty() {
+        let mut chunk = Chunk::default();
+        let records: [(&[u8], &[u8]); 5] =
+            [(b"", b"b"), (b"", b""), (b"", b"a"), (b"", b""), (b"", b"")];
+        for (key, value) in records {
+            assert!(chunk.make_room(key.len() + value.len(), 1 << 10));
+            chunk.push(key, value);
+        }
+        chunk.sort(None);
+        let values: Vec<&[u8]> = (0..chunk.len())
+            .map(|index| chunk.record(index).1)
+            .collect();
+        assert_eq!(values, [b"b".as_slice(), b"", b"a", b"", b""]);
+    }
+
+    #[test]
+    fn holds_a_record_larger_than_max_bytes_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 10, 64, root.path())).unwrap();
+        sorter.push(b"a", b"").unwrap();
+        sorter.push(b"b", &[0; 4 << 10]).unwrap();
+        sorter.push(b"c", b"").unwrap();
+        sorter.wait().unwrap();
+        assert_eq!(sorter.runs(), 2);
+        assert!(sorter.spare.as_ref().unwrap().capacity_bytes() <= sorter.limit);
+        let keys: Vec<Vec<u8>> = sorter
+            .finish()
+            .unwrap()
+            .map(|record| record.unwrap().0)
+            .collect();
+        assert_eq!(keys, [b"a", b"b", b"c"]);
+    }
+
+    #[test]
     fn removes_its_runs_once_merged() {
         let root = tempfile::tempdir().unwrap();
         let mut sorter = Sorter::new(config(64, 2, root.path())).unwrap();
@@ -618,7 +752,7 @@ mod tests {
     #[test]
     fn a_failed_merge_removes_its_runs_and_stops() {
         let root = tempfile::tempdir().unwrap();
-        let mut sorter = Sorter::new(config(64, 1_000, root.path())).unwrap();
+        let mut sorter = Sorter::new(config(128, 1_000, root.path())).unwrap();
         for value in 0u32..200 {
             sorter.push(&value.to_be_bytes(), b"value").unwrap();
         }
