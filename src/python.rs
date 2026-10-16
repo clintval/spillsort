@@ -735,7 +735,7 @@ fn write_all(write: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<()> {
 }
 
 /// The items of a sorter, merged in order as they are read.
-#[pyclass(module = "spillsort", frozen, generic)]
+#[pyclass(module = "spillsort", name = "_SortedIterator", frozen)]
 struct SortedIterator {
     state: Arc<Lock<State>>,
     decode: Option<Py<PyAny>>,
@@ -816,6 +816,5 @@ impl Drop for SortedIterator {
 #[pymodule(gil_used = false)]
 fn _spillsort(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySorter>()?;
-    m.add_class::<SortedIterator>()?;
     Ok(())
 }

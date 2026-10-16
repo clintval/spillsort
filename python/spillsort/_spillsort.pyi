@@ -9,15 +9,13 @@ from typing import TypeVar
 from typing import final
 
 from typing_extensions import Self
-from typing_extensions import override
 
 from spillsort._codec import Codec
 from spillsort._codec import SortKey
 
-__all__ = ["SortedIterator", "Sorter"]
+__all__ = ["Sorter"]
 
 _T = TypeVar("_T")
-_T_co = TypeVar("_T_co", covariant=True)
 
 class _Writable(Protocol):
     def write(self, data: bytes, /) -> object: ...
@@ -84,7 +82,7 @@ class Sorter(Generic[_T]):
     def __len__(self) -> int:
         """The number of items added."""
 
-    def sort(self, items: Iterable[_T] = ..., /) -> SortedIterator[_T]:
+    def sort(self, items: Iterable[_T] = ..., /) -> Iterator[_T]:
         """Add every item given, then return every item added, decoded, in sorted order.
 
         Items are keyed and encoded as they are added. A sorter can be sorted only once; items
@@ -98,7 +96,7 @@ class Sorter(Generic[_T]):
             OSError: If spilling, or reading what was spilled, fails.
         """
 
-    def encoded(self) -> SortedIterator[bytes]:
+    def encoded(self) -> Iterator[bytes]:
         """Return the encoded items, as bytes, in sorted order, decoding none of them."""
 
     def write_to(self, handle: _Writable, /) -> None:
@@ -119,12 +117,3 @@ class Sorter(Generic[_T]):
         traceback: TracebackType | None,
         /,
     ) -> None: ...
-
-@final
-class SortedIterator(Iterator[_T_co]):
-    """The items of a sorter, merged in order as they are read."""
-
-    @override
-    def __iter__(self) -> Self: ...
-    @override
-    def __next__(self) -> _T_co: ...
