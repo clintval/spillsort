@@ -1,6 +1,7 @@
 """A forked child sorts on threads of its own, whatever its parent sorted on threads before."""
 
 import multiprocessing
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ def sort_spilling(tmp_dir: Path) -> None:
 
 
 @pytest.mark.skipif(
-    "fork" not in multiprocessing.get_all_start_methods(), reason="fork is unavailable"
+    sys.platform != "linux", reason="forking after threads have run is only safe on Linux"
 )
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_a_forked_child_sorts_after_its_parent_sorted_on_threads(tmp_path: Path) -> None:
