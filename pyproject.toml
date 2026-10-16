@@ -32,6 +32,7 @@ classifiers = [
 "Bug Tracker" = "https://github.com/clintval/spillsort/issues"
 
 [dependency-groups]
+benchmark = ["pysam ~=0.24; sys_platform != 'win32'"]
 dev = [
     "basedpyright ~=1.40",
     "hypothesis ~=6.168",
@@ -66,6 +67,7 @@ exclude       = [
 ]
 
 [tool.uv]
+default-groups = ["benchmark", "dev"]
 # Ignore releases younger than a week, so a compromised publish has time to be
 # caught before it can be locked. Must stay >= the Dependabot `cooldown` in
 # .github/dependabot.yml, or Dependabot will propose versions that can't lock.
