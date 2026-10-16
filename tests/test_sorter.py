@@ -351,7 +351,7 @@ def test_a_run_that_is_cut_short_is_an_error_when_read(tmp_path: Path) -> None:
     first = spilled(tmp_path)[0]
     first.write_bytes(first.read_bytes()[:-1])
     iterator = sorter.sort()
-    with pytest.raises(OSError, match="ended before its last record"):
+    with pytest.raises(OSError, match="is corrupt: a record is longer than the rest of the run"):
         list(iterator)
     assert list(tmp_path.iterdir()) == []
     assert next(iterator, None) is None
