@@ -6,7 +6,7 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 
@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyFloat, PyInt, PyList, PyString, PyTuple};
 use pyo3::{PyTraverseError, PyVisit};
 
+use crate::channel;
 use crate::key;
 use crate::sorter::POLL;
 use crate::{
@@ -657,7 +658,7 @@ impl PySorter {
         let Some(mut merged) = self.finish(py, false)? else {
             return Ok(());
         };
-        let (sender, receiver) = mpsc::sync_channel::<crate::Result<Vec<u8>>>(2);
+        let (sender, receiver) = channel::sync_channel::<crate::Result<Vec<u8>>>(2);
         let merger = thread::Builder::new()
             .name("spillsort-merge".to_owned())
             .spawn(move || {
@@ -678,15 +679,9 @@ impl PySorter {
                     }
                 }
             })?;
-        let mut receiver = Some(receiver);
         let written = (|| -> PyResult<()> {
             loop {
-                let waiting = receiver
-                    .take()
-                    .expect("the receiver is put back after each message");
-                let (message, waiting) = py.detach(move || (waiting.recv_timeout(POLL), waiting));
-                receiver = Some(waiting);
-                match message {
+                match py.detach(|| receiver.recv_timeout(POLL)) {
                     Ok(message) => write_all(&write, &message.map_err(to_python)?)?,
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Ok(()),

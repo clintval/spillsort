@@ -8,7 +8,7 @@ use std::mem;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use rayon::slice::ParallelSliceMut;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tempfile::TempDir;
 
+use crate::channel::{self, Receiver};
 use crate::merge::{Merged, Source};
 use crate::run::{Run, RunReader, RunWriter};
 use crate::{Error, Result};
@@ -505,7 +506,7 @@ impl Sorter {
             bytes: chunk.run_bytes(),
         });
         let (pool, limit) = (self.pool.clone(), self.limit);
-        let (sender, done) = mpsc::sync_channel(1);
+        let (sender, done) = channel::sync_channel(1);
         let handle = thread::Builder::new()
             .name("spillsort-spill".to_owned())
             .spawn(move || {
