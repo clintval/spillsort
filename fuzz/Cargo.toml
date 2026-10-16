@@ -1,0 +1,29 @@
+[package]
+name = "spillsort-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+spillsort = { path = ".." }
+
+[[bin]]
+name = "key_order"
+path = "fuzz_targets/key_order.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sort_records"
+path = "fuzz_targets/sort_records.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
