@@ -2,6 +2,7 @@
 
 #![allow(clippy::doc_markdown)]
 
+use std::io;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -36,10 +37,28 @@ const CLOSED: u8 = 2;
 
 fn to_python(error: Error) -> PyErr {
     match error {
-        Error::Io(error) => error.into(),
+        Error::Io(error) | Error::Output(error) => os_error(error, None),
+        Error::Path { path, error } => os_error(error, Some(path)),
         Error::Invalid(message) => PyValueError::new_err(message),
         error @ Error::Failed => PyRuntimeError::new_err(error.to_string()),
     }
+}
+
+/// The OSError Python raises when a system call fails, with its errno, its reason, and the path,
+/// from which Python picks the subclass, or, for an error with no code, the subclass of its kind.
+fn os_error(error: io::Error, path: Option<PathBuf>) -> PyErr {
+    let Some(code) = error.raw_os_error() else {
+        let error = match path {
+            Some(path) => io::Error::new(error.kind(), format!("{}: {error}", path.display())),
+            None => error,
+        };
+        return error.into();
+    };
+    let message = error.to_string();
+    let suffix = format!(" (os error {code})");
+    let reason = message.strip_suffix(&suffix).unwrap_or(&message).to_owned();
+    // Python reads the code as winerror on Windows, where it is one, and ignores it elsewhere.
+    PyOSError::new_err((code, reason, path.map(PathBuf::into_os_string), code))
 }
 
 fn closed_error() -> PyErr {

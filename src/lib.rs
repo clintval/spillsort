@@ -46,6 +46,7 @@ mod python;
 
 use std::fmt;
 use std::io;
+use std::path::{Path, PathBuf};
 
 pub use merge::Merged;
 pub use sorter::{
@@ -59,13 +60,24 @@ struct ReadmeDoctests;
 
 /// An error from sorting or merging.
 ///
-/// An [`Error::Io`] shows its I/O error's message, so its source is that error's source, not the
-/// error itself, and a report of the chain names each cause once.
+/// An [`Error::Io`], [`Error::Path`], or [`Error::Output`] shows its I/O error's message, so its
+/// source is that error's source, not the error itself, and a report of the chain names each cause
+/// once.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// Writing or reading a run failed.
+    /// Writing or reading failed, as when a run is corrupt or the directory of runs cannot be made.
     Io(io::Error),
+    /// The operating system failed to read or write a path: `tmp_dir`, or a run.
+    Path {
+        /// The file or directory.
+        path: PathBuf,
+        /// The error as the operating system reported it, with its kind and its code.
+        error: io::Error,
+    },
+    /// Writing to the output of [`Merged::write_values`] failed, losing the value being written,
+    /// so the merge cannot go on.
+    Output(io::Error),
     /// A setting or a record is invalid, such as a key of 4 GiB or more.
     Invalid(String),
     /// An earlier error lost records, so the sorter or merge cannot go on.
@@ -74,7 +86,10 @@ pub enum Error {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        Error::Io(error)
+        match error.downcast::<PathError>() {
+            Ok(PathError { path, error }) => Error::Path { path, error },
+            Err(error) => Error::Io(error),
+        }
     }
 }
 
@@ -82,6 +97,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(error) => error.fmt(f),
+            Error::Path { path, error } => write!(f, "{}: {error}", path.display()),
+            Error::Output(error) => write!(f, "writing the output failed: {error}"),
             Error::Invalid(message) => f.write_str(message),
             Error::Failed => f.write_str("an earlier error lost records, so sorting cannot go on"),
         }
@@ -91,10 +108,37 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io(error) => error.source(),
+            Error::Io(error) | Error::Path { error, .. } | Error::Output(error) => error.source(),
             Error::Invalid(_) | Error::Failed => None,
         }
     }
+}
+
+/// An I/O error and the path it happened at, carried in an [`io::Error`] until it becomes an
+/// [`Error::Path`].
+#[derive(Debug)]
+struct PathError {
+    path: PathBuf,
+    error: io::Error,
+}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.error)
+    }
+}
+
+impl std::error::Error for PathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// Names the path an I/O error happened at, keeping the error, so its kind and code survive.
+pub(crate) fn with_path(error: io::Error, path: &Path) -> io::Error {
+    let kind = error.kind();
+    let path = path.to_path_buf();
+    io::Error::new(kind, PathError { path, error })
 }
 
 /// A result whose error is an [`Error`].

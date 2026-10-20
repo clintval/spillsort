@@ -1,5 +1,6 @@
 """A sorter returns what was added in sorted, stable order, and leaves no files behind."""
 
+import errno
 import gc
 import io
 import os
@@ -401,9 +402,12 @@ def test_a_run_that_is_cut_short_is_an_error_when_read(tmp_path: Path) -> None:
 def test_a_missing_run_is_an_error_when_read(tmp_path: Path) -> None:
     sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
     wait_for_runs(sorter, tmp_path, 3)
-    spilled(tmp_path)[0].unlink()
-    with pytest.raises(FileNotFoundError, match="run-000000"):
+    first = spilled(tmp_path)[0]
+    first.unlink()
+    with pytest.raises(FileNotFoundError) as raised:
         sorter.sort()
+    assert raised.value.errno == errno.ENOENT
+    assert raised.value.filename == str(first)
     assert list(tmp_path.iterdir()) == []
     with pytest.raises(RuntimeError, match="stopped"):
         sorter.sort()
@@ -424,6 +428,16 @@ def test_settings_are_checked(tmp_path: Path) -> None:
     (tmp_path / "file").touch()
     with pytest.raises(NotADirectoryError, match="is not a directory"):
         Sorter(tmp_dir=str(tmp_path / "file"))
+
+
+def test_an_os_error_keeps_its_errno_and_names_its_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    with pytest.raises(FileNotFoundError) as raised:
+        Sorter(tmp_dir=missing)
+    assert raised.value.errno == errno.ENOENT
+    assert raised.value.filename == str(missing)
+    assert raised.value.strerror
+    assert "os error" not in raised.value.strerror
 
 
 @pytest.mark.skipif(
