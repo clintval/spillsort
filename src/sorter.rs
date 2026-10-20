@@ -320,14 +320,13 @@ struct Pending {
     done: Receiver<io::Result<Chunk>>,
 }
 
-/// Makes a private directory for runs in `root`, or in the system's temporary directory.
+/// Makes a private directory for runs in `root`, or in the system's temporary directory. An
+/// error names the directory it tried to make.
 fn make_dir(root: Option<&Path>) -> io::Result<TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("spillsort-");
     let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
-    builder
-        .tempdir_in(&root)
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))
+    tempfile::Builder::new()
+        .prefix("spillsort-")
+        .tempdir_in(root)
 }
 
 /// The error for work given up because the caller asked to stop.
@@ -357,8 +356,9 @@ impl Sorter {
             ));
         }
         if let Some(dir) = &config.tmp_dir {
-            let metadata = fs::metadata(dir).map_err(|error| {
-                io::Error::new(error.kind(), format!("{}: {error}", dir.display()))
+            let metadata = fs::metadata(dir).map_err(|error| Error::Path {
+                path: dir.clone(),
+                error,
             })?;
             if !metadata.is_dir() {
                 let message = format!("{} is not a directory", dir.display());
@@ -908,7 +908,12 @@ mod tests {
                 break error;
             }
         };
-        assert!(matches!(error, Error::Io(_)), "{error:?}");
+        let Error::Path { path, error } = &error else {
+            panic!("expected an error at a path, not {error:?}");
+        };
+        assert!(path.starts_with(root.path()), "{}", path.display());
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.raw_os_error().is_some(), "{error:?}");
         assert!(matches!(sorter.push(b"", b""), Err(Error::Failed)));
         assert!(matches!(sorter.finish(), Err(Error::Failed)));
     }
@@ -961,12 +966,27 @@ mod tests {
         );
         let missing = root.path().join("missing");
         let error = Sorter::new(Config::default().tmp_dir(&missing)).unwrap_err();
-        assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::NotFound));
+        assert!(matches!(&error, Error::Path { path, .. } if *path == missing));
         assert!(error.to_string().contains("missing"));
         let file = root.path().join("file");
         fs::write(&file, b"").unwrap();
         let error = Sorter::new(Config::default().tmp_dir(&file)).unwrap_err();
         assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::NotADirectory));
+    }
+
+    #[test]
+    fn keeps_the_error_of_the_operating_system_whole() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let expected = fs::metadata(&missing).unwrap_err();
+        let error = Sorter::new(Config::default().tmp_dir(&missing)).unwrap_err();
+        let Error::Path { error, .. } = error else {
+            panic!("expected an error at a path, not {error:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.raw_os_error().is_some(), "{error:?}");
+        assert_eq!(error.raw_os_error(), expected.raw_os_error());
+        assert_eq!(error.to_string(), expected.to_string());
     }
 
     #[cfg(unix)]
@@ -986,7 +1006,7 @@ mod tests {
             assert!(
                 matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::PermissionDenied)
             );
-            assert!(error.to_string().contains("locked"), "{error}");
+            assert_eq!(error.to_string().matches("locked").count(), 1, "{error}");
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     }

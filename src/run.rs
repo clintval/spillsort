@@ -6,12 +6,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 use rayon::ThreadPool;
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+
+use crate::with_path;
 
 /// The most bytes of records a block holds.
 const BLOCK: usize = 128 << 10;
@@ -36,10 +38,6 @@ pub(crate) struct Run {
 /// The bytes a record takes in a run, before it is compressed.
 pub(crate) fn record_bytes(key: &[u8], value: &[u8]) -> u64 {
     (8 + key.len() + value.len()) as u64
-}
-
-fn with_path(error: &io::Error, path: &Path) -> io::Error {
-    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
 fn corrupt(reason: &str) -> io::Error {
@@ -88,7 +86,7 @@ impl RunWriter {
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|error| with_path(&error, &path))?;
+            .map_err(|error| with_path(error, &path))?;
         let blocks = pool
             .as_ref()
             .map_or(1, |pool| (2 * pool.current_num_threads()).min(MOST_BLOCKS));
@@ -113,7 +111,7 @@ impl RunWriter {
         })();
         self.records += 1;
         self.bytes += record_bytes(key, value);
-        written.map_err(|error| with_path(&error, &self.path))
+        written.map_err(|error| with_path(error, &self.path))
     }
 
     /// The number of records written so far.
@@ -124,7 +122,7 @@ impl RunWriter {
     pub fn finish(mut self) -> io::Result<Run> {
         self.write_blocks()
             .and_then(|()| self.file.flush())
-            .map_err(|error| with_path(&error, &self.path))?;
+            .map_err(|error| with_path(error, &self.path))?;
         Ok(Run {
             path: self.path,
             records: self.records,
@@ -190,7 +188,7 @@ pub(crate) struct RunReader {
 
 impl RunReader {
     pub fn open(run: &Run) -> io::Result<Self> {
-        let file = File::open(&run.path).map_err(|error| with_path(&error, &run.path))?;
+        let file = File::open(&run.path).map_err(|error| with_path(error, &run.path))?;
         Ok(RunReader {
             file,
             path: run.path.clone(),
@@ -219,7 +217,7 @@ impl RunReader {
                     let message = format!("{} is corrupt: {error}", self.path.display());
                     io::Error::new(io::ErrorKind::InvalidData, message)
                 }
-                _ => with_path(&error, &self.path),
+                _ => with_path(error, &self.path),
             })?;
         self.left -= 1;
         Ok(true)
