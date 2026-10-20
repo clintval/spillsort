@@ -237,7 +237,10 @@ pub struct Config {
     /// and spilled, so neither holds more than half of this, unless one record alone needs more.
     pub max_bytes: usize,
     /// The directory in which a private directory of runs is made, or None for the system's
-    /// temporary directory, which is `TMPDIR` on Unix.
+    /// temporary directory, as [`std::env::temp_dir`] finds it, which on Unix is `TMPDIR` if it is
+    /// set, except that an empty `TMPDIR` means `/tmp`, as it does to Python's
+    /// `tempfile.gettempdir()` and GNU `mktemp`, not the current directory. A relative directory
+    /// is resolved against the current directory when the sorter is made.
     pub tmp_dir: Option<PathBuf>,
     /// The most runs to merge at once. Beyond that, the fewest neighboring runs needed are merged
     /// into one first, as many times as it takes. A merge reads each run a block of up to 128 KiB
@@ -306,6 +309,7 @@ pub struct Sorter {
     limit: usize,
     chunk: Chunk,
     spare: Option<Chunk>,
+    root: PathBuf,
     dir: Option<TempDir>,
     runs: Vec<Run>,
     made: usize,
@@ -320,10 +324,17 @@ struct Pending {
     done: Receiver<io::Result<Chunk>>,
 }
 
-/// Makes a private directory for runs in `root`, or in the system's temporary directory. An
-/// error names the directory it tried to make.
-fn make_dir(root: Option<&Path>) -> io::Result<TempDir> {
-    let root = root.map_or_else(std::env::temp_dir, Path::to_path_buf);
+/// The system's temporary directory, as [`std::env::temp_dir`] finds it, but `/tmp` rather than
+/// the current directory when `TMPDIR` is empty on Unix.
+fn system_tmp_dir() -> PathBuf {
+    match std::env::var_os("TMPDIR") {
+        Some(dir) if dir.is_empty() && cfg!(unix) => PathBuf::from("/tmp"),
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// Makes a private directory for runs in `root`. An error names the directory it tried to make.
+fn make_dir(root: &Path) -> io::Result<TempDir> {
     tempfile::Builder::new()
         .prefix("spillsort-")
         .tempdir_in(root)
@@ -355,17 +366,17 @@ impl Sorter {
                 "threads must be at least 1, not 0".to_owned(),
             ));
         }
-        if let Some(dir) = &config.tmp_dir {
-            let metadata = fs::metadata(dir).map_err(|error| Error::Path {
-                path: dir.clone(),
-                error,
-            })?;
-            if !metadata.is_dir() {
-                let message = format!("{} is not a directory", dir.display());
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, message).into());
-            }
+        let root = config.tmp_dir.clone().unwrap_or_else(system_tmp_dir);
+        let root = std::path::absolute(root)?;
+        let metadata = fs::metadata(&root).map_err(|error| Error::Path {
+            path: root.clone(),
+            error,
+        })?;
+        if !metadata.is_dir() {
+            let message = format!("{} is not a directory", root.display());
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, message).into());
         }
-        make_dir(config.tmp_dir.as_deref())?;
+        make_dir(&root)?;
         let pool = if config.threads > 1 {
             let pool = ThreadPoolBuilder::new()
                 .num_threads(config.threads)
@@ -382,6 +393,7 @@ impl Sorter {
             config,
             chunk: Chunk::default(),
             spare: None,
+            root,
             dir: None,
             runs: Vec::new(),
             made: 0,
@@ -462,7 +474,7 @@ impl Sorter {
     fn next_path(&mut self) -> Result<PathBuf> {
         let dir = match &mut self.dir {
             Some(dir) => dir,
-            empty => empty.insert(make_dir(self.config.tmp_dir.as_deref())?),
+            empty => empty.insert(make_dir(&self.root)?),
         };
         let path = dir.path().join(format!("run-{:06}", self.made));
         self.made += 1;
@@ -1009,6 +1021,78 @@ mod tests {
             assert_eq!(error.to_string().matches("locked").count(), 1, "{error}");
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Marks the process that [`run_alone`] starts.
+    #[cfg(unix)]
+    const ALONE: &str = "SPILLSORT_TEST_ALONE";
+
+    /// Runs `test` again in a process of its own, in `cwd`, with `TMPDIR` set to `tmpdir`, which
+    /// changes nothing for the tests running alongside it.
+    #[cfg(unix)]
+    fn run_alone(test: &str, cwd: &Path, tmpdir: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact"])
+            .env(ALONE, "1")
+            .env("TMPDIR", tmpdir)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        let failure = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{printed}{failure}");
+        assert!(printed.contains("1 passed"), "{printed}");
+    }
+
+    /// Pushes records until a run spills, and returns the private directory it went in.
+    #[cfg(unix)]
+    fn spill_dir(sorter: &mut Sorter) -> PathBuf {
+        let mut value = 0u32;
+        while sorter.runs() == 0 {
+            sorter.push(&value.to_be_bytes(), b"").unwrap();
+            value += 1;
+        }
+        sorter.dir.as_ref().unwrap().path().to_path_buf()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_tmpdir_means_tmp_and_not_the_current_directory() {
+        if std::env::var_os(ALONE).is_none() {
+            let cwd = tempfile::tempdir().unwrap();
+            let test = "sorter::tests::an_empty_tmpdir_means_tmp_and_not_the_current_directory";
+            run_alone(test, cwd.path(), "");
+            return;
+        }
+        let mut sorter = Sorter::new(Config::default().max_bytes(64)).unwrap();
+        let dir = spill_dir(&mut sorter);
+        assert!(dir.starts_with("/tmp"), "{}", dir.display());
+        assert_eq!(entries(&std::env::current_dir().unwrap()), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_tmp_dir_is_resolved_when_the_sorter_is_made() {
+        if std::env::var_os(ALONE).is_none() {
+            let cwd = tempfile::tempdir().unwrap();
+            for name in ["from-env", "given", "elsewhere"] {
+                fs::create_dir(cwd.path().join(name)).unwrap();
+            }
+            let test = "sorter::tests::a_relative_tmp_dir_is_resolved_when_the_sorter_is_made";
+            run_alone(test, cwd.path(), "from-env");
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let error = Sorter::new(Config::default().tmp_dir("missing")).unwrap_err();
+        assert!(
+            matches!(&error, Error::Path { path, .. } if *path == cwd.join("missing")),
+            "{error:?}"
+        );
+        let mut from_env = Sorter::new(Config::default().max_bytes(64)).unwrap();
+        let mut given = Sorter::new(Config::default().max_bytes(64).tmp_dir("given")).unwrap();
+        std::env::set_current_dir("elsewhere").unwrap();
+        assert!(spill_dir(&mut from_env).starts_with(cwd.join("from-env")));
+        assert!(spill_dir(&mut given).starts_with(cwd.join("given")));
     }
 
     #[test]
