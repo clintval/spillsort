@@ -200,6 +200,18 @@ impl Chunk {
         run.finish()
     }
 
+    /// An empty chunk with this one's capacities, unless they are more than `limit`, so that
+    /// filling it while this one spills does not grow it, which holds its old and new room at once.
+    fn empty_like(&self, limit: usize) -> Chunk {
+        if self.capacity_bytes() > limit {
+            return Chunk::default();
+        }
+        Chunk {
+            arena: Vec::with_capacity(self.arena.capacity()),
+            entries: Vec::with_capacity(self.entries.capacity()),
+        }
+    }
+
     /// Empties the chunk, keeping what it allocated to fill again unless that is more than
     /// `limit`.
     fn clear(&mut self, limit: usize) {
@@ -294,6 +306,11 @@ impl Config {
 }
 
 /// Sorts records pushed in any order, then [`Sorter::finish`] returns them merged in order.
+///
+/// The records it holds take at most [`Config::max_bytes`], unless one alone needs more. Beyond
+/// that, writing a run holds the buffers that [`Config::threads`] describes, and a merge holds the
+/// next record of each run it reads, so up to [`Config::max_open`] times the largest record, and a
+/// block of each and room for it compressed, about 269 KiB a run.
 ///
 /// Runs are written to a private directory, made at the first spill, which is removed when the
 /// [`Merged`] records have all been read, or when the sorter or the merge is dropped. After an
@@ -501,7 +518,11 @@ impl Sorter {
     fn spill(&mut self) -> Result<()> {
         self.wait()?;
         let path = self.next_path()?;
-        let mut chunk = mem::replace(&mut self.chunk, self.spare.take().unwrap_or_default());
+        let next = match self.spare.take() {
+            Some(spare) => spare,
+            None => self.chunk.empty_like(self.limit),
+        };
+        let mut chunk = mem::replace(&mut self.chunk, next);
         self.runs.push(Run {
             path: path.clone(),
             records: chunk.len() as u64,
@@ -761,6 +782,26 @@ mod tests {
         let least = (sorter.limit - sorter.limit / 8) / (17 + ENTRY_BYTES);
         assert!(sorter.runs() > 2);
         assert!(sorter.runs.iter().all(|run| run.records as usize >= least));
+    }
+
+    #[test]
+    fn fills_the_next_chunk_without_growing_it_while_the_first_spills() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 64, root.path())).unwrap();
+        let mut value = 0u64;
+        while sorter.runs() == 0 {
+            sorter.push(&value.to_be_bytes(), &[7; 9]).unwrap();
+            value += 1;
+        }
+        let capacities = |chunk: &Chunk| (chunk.arena.capacity(), chunk.entries.capacity());
+        let first = capacities(&sorter.chunk);
+        assert!(sorter.chunk.capacity_bytes() > sorter.limit / 2);
+        assert!(sorter.chunk.capacity_bytes() <= sorter.limit);
+        while sorter.runs() == 1 {
+            assert_eq!(capacities(&sorter.chunk), first);
+            sorter.push(&value.to_be_bytes(), &[7; 9]).unwrap();
+            value += 1;
+        }
     }
 
     #[test]
