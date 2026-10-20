@@ -2,8 +2,9 @@
 //! value, all little-endian. The records are cut into blocks of 128 KiB, the last shorter, so a
 //! record may span blocks, and each block is compressed with LZ4 and written after its compressed
 //! and uncompressed lengths and a CRC-32 (IEEE, as zlib's) of its index in the run, those lengths,
-//! and the compressed block, as u32s. A run is read a block at a time, and a block changed, moved,
-//! or repeated on disk is an error before it is decompressed.
+//! and the compressed block, started from the CRC-32 of the run's path, as u32s. A run is read a
+//! block at a time, and a block changed, moved, or repeated on disk, or a run overwritten with
+//! another's bytes, is an error before it is decompressed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -51,9 +52,14 @@ fn corrupt(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-/// The CRC-32 of a block's index in its run, its lengths, and its compressed bytes.
-fn checksum(index: u64, lengths: &[u8], compressed: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
+/// The CRC-32 of a run's path, from which the checksum of each of its blocks starts.
+fn seed(path: &Path) -> u32 {
+    crc32fast::hash(path.as_os_str().as_encoded_bytes())
+}
+
+/// The CRC-32 of a block's index in its run, its lengths, and its compressed bytes, from a seed.
+fn checksum(seed: u32, index: u64, lengths: &[u8], compressed: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new_with_initial(seed);
     hasher.update(&index.to_le_bytes());
     hasher.update(lengths);
     hasher.update(compressed);
@@ -69,7 +75,7 @@ struct Block {
 }
 
 impl Block {
-    fn compress(&mut self, index: u64) -> io::Result<()> {
+    fn compress(&mut self, seed: u32, index: u64) -> io::Result<()> {
         let most = HEADER + get_maximum_output_size(self.records.len());
         if self.compressed.len() < most {
             self.compressed.resize(most, 0);
@@ -78,7 +84,7 @@ impl Block {
         let size = compress_into(&self.records, payload).map_err(io::Error::other)?;
         header[..4].copy_from_slice(&(size as u32).to_le_bytes());
         header[4..LENGTHS].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
-        let sum = checksum(index, &header[..LENGTHS], &payload[..size]);
+        let sum = checksum(seed, index, &header[..LENGTHS], &payload[..size]);
         header[LENGTHS..].copy_from_slice(&sum.to_le_bytes());
         self.written = HEADER + size;
         Ok(())
@@ -94,6 +100,7 @@ pub(crate) struct RunWriter {
     pool: Option<Arc<ThreadPool>>,
     blocks: Vec<Block>,
     filling: usize,
+    seed: u32,
     index: u64,
     records: u64,
     bytes: u64,
@@ -111,6 +118,7 @@ impl RunWriter {
             .map_or(1, |pool| (2 * pool.current_num_threads()).min(MOST_BLOCKS));
         Ok(RunWriter {
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
+            seed: seed(&path),
             path,
             pool,
             blocks: (0..blocks).map(|_| Block::default()).collect(),
@@ -177,9 +185,9 @@ impl RunWriter {
             .iter()
             .take_while(|block| !block.records.is_empty())
             .count();
-        let (blocks, first) = (&mut self.blocks[..filled], self.index);
+        let (blocks, seed, first) = (&mut self.blocks[..filled], self.seed, self.index);
         let compress =
-            move |(index, block): (usize, &mut Block)| block.compress(first + index as u64);
+            move |(index, block): (usize, &mut Block)| block.compress(seed, first + index as u64);
         match &self.pool {
             Some(pool) if filled > 1 => {
                 pool.install(|| blocks.par_iter_mut().enumerate().try_for_each(compress))?;
@@ -205,6 +213,7 @@ pub(crate) struct RunReader {
     ahead: Range<usize>,
     block: Vec<u8>,
     read: usize,
+    seed: u32,
     index: u64,
     left: u64,
     bytes_left: u64,
@@ -220,6 +229,7 @@ impl RunReader {
             ahead: 0..0,
             block: Vec::new(),
             read: 0,
+            seed: seed(&run.path),
             index: 0,
             left: run.records,
             bytes_left: run.bytes,
@@ -304,7 +314,13 @@ impl RunReader {
         }
         let read = read_at_least(&mut self.file, &mut self.compressed[..size + HEADER], size)?;
         self.ahead = size..read;
-        if checksum(self.index, &header[..LENGTHS], &self.compressed[..size]) != sum {
+        if checksum(
+            self.seed,
+            self.index,
+            &header[..LENGTHS],
+            &self.compressed[..size],
+        ) != sum
+        {
             return Err(corrupt("a block does not match its checksum"));
         }
         self.index += 1;
@@ -342,6 +358,8 @@ mod tests {
     use std::io::Seek;
 
     use super::*;
+
+    type Records = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn write(path: PathBuf, records: &[(&[u8], &[u8])]) -> Run {
         let mut writer = RunWriter::create(path, None).unwrap();
@@ -399,6 +417,24 @@ mod tests {
         write(path, &records)
     }
 
+    /// A run of 64-byte records, keyed from `first`, that fill `blocks` blocks exactly, and its
+    /// records.
+    fn block_aligned_run(path: PathBuf, blocks: usize, first: u64) -> (Run, Records) {
+        let values = noise(48 * blocks * BLOCK / 64);
+        let expected: Records = values
+            .chunks(48)
+            .zip(first..)
+            .map(|(value, key)| (key.to_be_bytes().to_vec(), value.to_vec()))
+            .collect();
+        let records: Vec<(&[u8], &[u8])> = expected
+            .iter()
+            .map(|(key, value)| (&key[..], &value[..]))
+            .collect();
+        let run = write(path, &records);
+        assert_eq!(run.bytes, (blocks * BLOCK) as u64);
+        (run, expected)
+    }
+
     /// The offset of each block in a run's bytes.
     fn block_offsets(bytes: &[u8]) -> Vec<usize> {
         let mut offsets = Vec::new();
@@ -413,12 +449,17 @@ mod tests {
     }
 
     /// Rewrites the checksum of a run's block at `index` to match the bytes it now holds.
-    fn seal(bytes: &mut [u8], index: usize) {
+    fn seal(run: &Run, bytes: &mut [u8], index: usize) {
         let offset = block_offsets(bytes)[index];
         let size = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         let payload = offset + HEADER;
         let lengths = &bytes[offset..offset + LENGTHS];
-        let sum = checksum(index as u64, lengths, &bytes[payload..payload + size]);
+        let sum = checksum(
+            seed(&run.path),
+            index as u64,
+            lengths,
+            &bytes[payload..payload + size],
+        );
         bytes[offset + LENGTHS..payload].copy_from_slice(&sum.to_le_bytes());
     }
 
@@ -499,18 +540,19 @@ mod tests {
             .num_threads(3)
             .build()
             .unwrap();
-        let alone = long_run(dir.path().join("alone"));
-        let mut writer =
-            RunWriter::create(dir.path().join("pooled"), Some(Arc::new(pool))).unwrap();
+        let alone = long_run(dir.path().join("run"));
+        let (records, written) = (read(&alone).unwrap(), fs::read(&alone.path).unwrap());
+        fs::remove_file(&alone.path).unwrap();
+        let mut writer = RunWriter::create(alone.path.clone(), Some(Arc::new(pool))).unwrap();
         assert_eq!(writer.blocks.len(), 6);
-        for (key, value) in read(&alone).unwrap() {
+        for (key, value) in records {
             writer.push(&key, &value).unwrap();
         }
         let pooled = writer.finish().unwrap();
         assert_eq!((pooled.records, pooled.bytes), (alone.records, alone.bytes));
         let bytes = fs::read(&pooled.path).unwrap();
         assert!(block_offsets(&bytes).len() > 6);
-        assert_eq!(bytes, fs::read(&alone.path).unwrap());
+        assert_eq!(bytes, written);
     }
 
     #[test]
@@ -671,18 +713,7 @@ mod tests {
     #[test]
     fn whole_blocks_swapped_or_repeated_are_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let values = noise(48 * 5 * BLOCK / 64);
-        let expected: Vec<(Vec<u8>, Vec<u8>)> = values
-            .chunks(48)
-            .enumerate()
-            .map(|(index, value)| ((index as u64).to_be_bytes().to_vec(), value.to_vec()))
-            .collect();
-        let records: Vec<(&[u8], &[u8])> = expected
-            .iter()
-            .map(|(key, value)| (&key[..], &value[..]))
-            .collect();
-        let run = write(dir.path().join("run"), &records);
-        assert_eq!(run.bytes, 5 * BLOCK as u64);
+        let (run, expected) = block_aligned_run(dir.path().join("run"), 5, 0);
         let bytes = fs::read(&run.path).unwrap();
         let [_, one, two, three, _] = block_offsets(&bytes)[..] else {
             panic!("the run is not 5 blocks");
@@ -701,6 +732,15 @@ mod tests {
     }
 
     #[test]
+    fn a_run_overwritten_with_another_runs_bytes_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = block_aligned_run(dir.path().join("first"), 2, 0);
+        let (second, expected) = block_aligned_run(dir.path().join("second"), 2, 1 << 32);
+        fs::copy(&first.path, &second.path).unwrap();
+        assert_corrupt_after_right_records(&second, &expected);
+    }
+
+    #[test]
     fn a_block_that_matches_its_checksum_but_does_not_decompress_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let run = long_run(dir.path().join("run"));
@@ -708,7 +748,7 @@ mod tests {
         let offsets = block_offsets(&bytes);
         let mut garbled = bytes.clone();
         garbled[offsets[1] + HEADER..offsets[2]].fill(0);
-        seal(&mut garbled, 1);
+        seal(&run, &mut garbled, 1);
         fs::write(&run.path, &garbled).unwrap();
         assert_unreadable(&run, InvalidData, "is corrupt: a block does not decompress");
 
@@ -718,7 +758,7 @@ mod tests {
         for wrong in [length - 1, length + 1] {
             let mut garbled = bytes.clone();
             garbled[last..last + 4].copy_from_slice(&wrong.to_le_bytes());
-            seal(&mut garbled, offsets.len() - 1);
+            seal(&run, &mut garbled, offsets.len() - 1);
             fs::write(&run.path, &garbled).unwrap();
             assert_unreadable(&run, InvalidData, "is corrupt: a block does not decompress");
         }
