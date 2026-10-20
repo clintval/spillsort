@@ -55,8 +55,9 @@ struct ReadmeDoctests;
 
 /// An error from sorting or merging.
 ///
-/// An [`Error::Io`] or [`Error::Path`] shows its I/O error's message, so its source is that
-/// error's source, not the error itself, and a report of the chain names each cause once.
+/// An [`Error::Io`], [`Error::Path`], or [`Error::Output`] shows its I/O error's message, so its
+/// source is that error's source, not the error itself, and a report of the chain names each cause
+/// once.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -69,6 +70,9 @@ pub enum Error {
         /// The error as the operating system reported it, with its kind and its code.
         error: io::Error,
     },
+    /// Writing to the output of [`Merged::write_values`] failed, losing the value being written,
+    /// so the merge cannot go on.
+    Output(io::Error),
     /// A setting or a record is invalid, such as a key of 4 GiB or more.
     Invalid(String),
     /// An earlier error lost records, so the sorter or merge cannot go on.
@@ -89,6 +93,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(error) => error.fmt(f),
             Error::Path { path, error } => write!(f, "{}: {error}", path.display()),
+            Error::Output(error) => write!(f, "writing the output failed: {error}"),
             Error::Invalid(message) => f.write_str(message),
             Error::Failed => f.write_str("an earlier error lost records, so sorting cannot go on"),
         }
@@ -98,7 +103,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io(error) | Error::Path { error, .. } => error.source(),
+            Error::Io(error) | Error::Path { error, .. } | Error::Output(error) => error.source(),
             Error::Invalid(_) | Error::Failed => None,
         }
     }

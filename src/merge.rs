@@ -116,10 +116,7 @@ impl Merged {
             return Err(Error::Failed);
         }
         if let Err(error) = self.advance() {
-            self.failed = true;
-            self.heap.clear();
-            self.current = None;
-            self.release();
+            self.fail();
             return Err(error.into());
         }
         Ok(self
@@ -129,13 +126,21 @@ impl Merged {
     }
 
     /// Writes the value of every record not yet read, in order, and returns how many there were.
+    /// If writing to `out` fails, the value being written is lost, so this returns
+    /// [`Error::Output`] and the merge fails.
     pub fn write_values(&mut self, mut out: impl Write) -> Result<u64> {
         let mut written = 0;
         while let Some((_, value)) = self.next_record()? {
-            out.write_all(value)?;
+            if let Err(error) = out.write_all(value) {
+                self.fail();
+                return Err(Error::Output(error));
+            }
             written += 1;
         }
-        out.flush()?;
+        if let Err(error) = out.flush() {
+            self.fail();
+            return Err(Error::Output(error));
+        }
         Ok(written)
     }
 
@@ -174,6 +179,14 @@ impl Merged {
             Some(_) => self.remaining -= 1,
             None => self.release(),
         }
+    }
+
+    /// Stops after an error, removing the runs, so that every later read fails.
+    fn fail(&mut self) {
+        self.failed = true;
+        self.heap.clear();
+        self.current = None;
+        self.release();
     }
 
     /// Closes the runs and removes them.

@@ -37,7 +37,7 @@ const CLOSED: u8 = 2;
 
 fn to_python(error: Error) -> PyErr {
     match error {
-        Error::Io(error) => os_error(error, None),
+        Error::Io(error) | Error::Output(error) => os_error(error, None),
         Error::Path { path, error } => os_error(error, Some(path)),
         Error::Invalid(message) => PyValueError::new_err(message),
         error @ Error::Failed => PyRuntimeError::new_err(error.to_string()),
