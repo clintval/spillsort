@@ -58,6 +58,9 @@ with TemporaryDirectory() as tmp_dir, Sorter(max_bytes=2**20, threads=4, tmp_dir
 assert ordered == sorted(numbers)
 ```
 
+Without `tmp_dir`, runs spill into `tempfile.gettempdir()`, and from Rust into `std::env::temp_dir()`, which on Unix is `TMPDIR`.
+Either way, an empty `TMPDIR` means `/tmp`, never the current directory, and a relative directory is resolved when the sorter is made.
+
 Items are pickled while they wait unless a codec turns them into bytes and back:
 
 ```python
