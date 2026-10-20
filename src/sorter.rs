@@ -943,6 +943,49 @@ mod tests {
         assert_eq!(out, [1, 2, 3]);
     }
 
+    /// A writer that fails after taking this many writes, and fails every flush.
+    struct Failing(usize);
+
+    impl io::Write for Failing {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            match self.0.checked_sub(1) {
+                Some(left) => {
+                    self.0 = left;
+                    Ok(data.len())
+                }
+                None => Err(io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn an_output_error_fails_the_merge_rather_than_skip_a_value() {
+        for writes in [3, 1_000] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sorter = Sorter::new(config(64, 2, root.path())).unwrap();
+            for value in 0u32..100 {
+                sorter.push(&value.to_be_bytes(), b"line\n").unwrap();
+            }
+            let mut merged = sorter.finish().unwrap();
+            let error = merged.write_values(Failing(writes)).unwrap_err();
+            assert!(
+                matches!(&error, Error::Output(io) if io.kind() == io::ErrorKind::BrokenPipe),
+                "{error:?}"
+            );
+            assert!(error.to_string().starts_with("writing the output failed"));
+            assert_eq!(entries(root.path()), 0);
+            assert!(matches!(
+                merged.write_values(Vec::new()),
+                Err(Error::Failed)
+            ));
+            assert!(matches!(merged.next_record(), Err(Error::Failed)));
+        }
+    }
+
     #[test]
     fn refuses_to_go_on_after_a_failed_spill() {
         let root = tempfile::tempdir().unwrap();
