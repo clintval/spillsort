@@ -945,6 +945,45 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_byte_in_a_run_fails_the_merge_before_any_wrong_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 1_000, root.path())).unwrap();
+        for value in 0u32..20_000 {
+            sorter
+                .push(&value.to_be_bytes(), format!("{value:0100}").as_bytes())
+                .unwrap();
+        }
+        sorter.wait().unwrap();
+        assert!(sorter.runs() > 2);
+        for run in &sorter.runs {
+            let mut bytes = fs::read(&run.path).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            fs::write(&run.path, &bytes).unwrap();
+        }
+        let mut merged = sorter.finish().unwrap();
+        let mut expected = 0u32;
+        let error = loop {
+            match merged.next_record() {
+                Ok(Some((key, value))) => {
+                    assert_eq!(key, expected.to_be_bytes());
+                    assert_eq!(value, format!("{expected:0100}").as_bytes());
+                    expected += 1;
+                }
+                Ok(None) => panic!("the merge ended without noticing the changed runs"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::InvalidData));
+        assert!(
+            error
+                .to_string()
+                .contains("is corrupt: a block does not match its checksum")
+        );
+        assert_eq!(entries(root.path()), 0);
+        assert!(matches!(merged.next_record(), Err(Error::Failed)));
+    }
+
+    #[test]
     fn checks_its_settings() {
         let root = tempfile::tempdir().unwrap();
         let invalid = |config: Config| match Sorter::new(config) {

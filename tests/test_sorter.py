@@ -398,6 +398,20 @@ def test_a_run_that_is_cut_short_is_an_error_when_read(tmp_path: Path) -> None:
     assert next(iterator, None) is None
 
 
+def test_a_run_with_a_changed_byte_is_an_error_when_read(tmp_path: Path) -> None:
+    sorter: Sorter[int] = Sorter(max_bytes=2**20, tmp_dir=tmp_path)
+    wait_for_runs(sorter, tmp_path, 3)
+    first = spilled(tmp_path)[0]
+    changed = bytearray(first.read_bytes())
+    changed[-1] ^= 1
+    first.write_bytes(changed)
+    iterator = sorter.sort()
+    with pytest.raises(OSError, match="is corrupt: a block does not match its checksum"):
+        list(iterator)
+    assert list(tmp_path.iterdir()) == []
+    assert next(iterator, None) is None
+
+
 def test_a_missing_run_is_an_error_when_read(tmp_path: Path) -> None:
     sorter: Sorter[int] = Sorter(max_bytes=64, tmp_dir=tmp_path)
     wait_for_runs(sorter, tmp_path, 3)
