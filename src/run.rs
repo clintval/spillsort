@@ -582,6 +582,20 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_ends_within_any_block_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = long_run(dir.path().join("run"));
+        let bytes = fs::read(&run.path).unwrap();
+        let offsets = block_offsets(&bytes);
+        assert!(offsets.len() > 4);
+        let ends = offsets.iter().skip(1).copied().chain([bytes.len()]);
+        for (start, end) in offsets.iter().zip(ends) {
+            fs::write(&run.path, &bytes[..(start + HEADER + end) / 2]).unwrap();
+            assert_unreadable(&run, UnexpectedEof, "ended before its last record");
+        }
+    }
+
+    #[test]
     fn a_run_that_ends_after_a_whole_block_or_within_a_header_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let run = long_run(dir.path().join("run"));
