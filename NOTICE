@@ -9,6 +9,8 @@ code is copied from either.
 
 Sorting in parallel uses rayon (https://github.com/rayon-rs/rayon, MIT or
 Apache-2.0), temporary directories are made with tempfile
-(https://github.com/Stebalien/tempfile, MIT or Apache-2.0), and runs are
-compressed with lz4_flex (https://github.com/pseitz/lz4_flex, MIT). The Python
-bindings use PyO3 (https://github.com/PyO3/pyo3, MIT or Apache-2.0).
+(https://github.com/Stebalien/tempfile, MIT or Apache-2.0), runs are
+compressed with lz4_flex (https://github.com/pseitz/lz4_flex, MIT), and their
+blocks are checksummed with crc32fast (https://github.com/srijs/rust-crc32fast,
+MIT or Apache-2.0). The Python bindings use PyO3 (https://github.com/PyO3/pyo3,
+MIT or Apache-2.0).

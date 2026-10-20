@@ -191,8 +191,13 @@ impl Chunk {
         (self.arena.len() + 8 * self.len()) as u64
     }
 
-    fn write_run(&self, path: PathBuf, pool: Option<Arc<ThreadPool>>) -> io::Result<Run> {
-        let mut run = RunWriter::create(path, pool)?;
+    fn write_run(
+        &self,
+        path: PathBuf,
+        number: u64,
+        pool: Option<Arc<ThreadPool>>,
+    ) -> io::Result<Run> {
+        let mut run = RunWriter::create(path, number, pool)?;
         for index in 0..self.len() {
             let (key, value) = self.record(index);
             run.push(key, value)?;
@@ -488,14 +493,14 @@ impl Sorter {
         Merged::new(sources, self.dir.take(), self.count)
     }
 
-    fn next_path(&mut self) -> Result<PathBuf> {
+    fn next_run(&mut self) -> Result<(PathBuf, u64)> {
         let dir = match &mut self.dir {
             Some(dir) => dir,
             empty => empty.insert(make_dir(&self.root)?),
         };
-        let path = dir.path().join(format!("run-{:06}", self.made));
+        let number = self.made as u64;
         self.made += 1;
-        Ok(path)
+        Ok((dir.path().join(format!("run-{number:06}")), number))
     }
 
     /// Waits for the spill in progress, keeping its chunk to fill next.
@@ -529,7 +534,7 @@ impl Sorter {
 
     fn spill(&mut self) -> Result<()> {
         self.wait()?;
-        let path = self.next_path()?;
+        let (path, number) = self.next_run()?;
         let next = match self.spare.take() {
             Some(spare) => spare,
             None => self.chunk.empty_like(self.limit),
@@ -537,6 +542,7 @@ impl Sorter {
         let mut chunk = mem::replace(&mut self.chunk, next);
         self.runs.push(Run {
             path: path.clone(),
+            number,
             records: chunk.len() as u64,
             bytes: chunk.run_bytes(),
         });
@@ -546,7 +552,7 @@ impl Sorter {
             .name("spillsort-spill".to_owned())
             .spawn(move || {
                 chunk.sort(pool.as_deref());
-                let written = chunk.write_run(path, pool).map(|_| {
+                let written = chunk.write_run(path, number, pool).map(|_| {
                     chunk.clear(limit);
                     chunk
                 });
@@ -580,7 +586,8 @@ impl Sorter {
                 .collect::<io::Result<Vec<_>>>()?;
             let records = group.iter().map(|run| run.records).sum();
             let mut merged = Merged::new(sources, None, records)?;
-            let mut out = RunWriter::create(self.next_path()?, self.pool.clone())?;
+            let (path, number) = self.next_run()?;
+            let mut out = RunWriter::create(path, number, self.pool.clone())?;
             while let Some((key, value)) = merged.next_record()? {
                 out.push(key, value)?;
                 if out.records() % RECORDS_PER_ASK == 0 && stop() {
@@ -1043,6 +1050,68 @@ mod tests {
         assert_eq!(entries(root.path()), 0);
         assert!(matches!(merged.next_record(), Err(Error::Failed)));
         assert!(merged.next().is_none());
+    }
+
+    #[test]
+    fn writes_the_same_runs_whatever_the_tmp_dir() {
+        let spilled = |root: &Path| {
+            let mut sorter = Sorter::new(config(1 << 20, 1_000, root)).unwrap();
+            for value in 0u32..20_000 {
+                sorter
+                    .push(&value.to_be_bytes(), format!("{value:0100}").as_bytes())
+                    .unwrap();
+            }
+            sorter.wait().unwrap();
+            let runs: Vec<Vec<u8>> = sorter
+                .runs
+                .iter()
+                .map(|run| fs::read(&run.path).unwrap())
+                .collect();
+            runs
+        };
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let runs = spilled(first.path());
+        assert!(runs.len() > 2);
+        assert_eq!(runs, spilled(second.path()));
+    }
+
+    #[test]
+    fn a_changed_byte_in_a_run_fails_the_merge_before_any_wrong_record() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sorter = Sorter::new(config(1 << 20, 1_000, root.path())).unwrap();
+        for value in 0u32..20_000 {
+            sorter
+                .push(&value.to_be_bytes(), format!("{value:0100}").as_bytes())
+                .unwrap();
+        }
+        sorter.wait().unwrap();
+        assert!(sorter.runs() > 2);
+        for run in &sorter.runs {
+            let mut bytes = fs::read(&run.path).unwrap();
+            *bytes.last_mut().unwrap() ^= 1;
+            fs::write(&run.path, &bytes).unwrap();
+        }
+        let mut merged = sorter.finish().unwrap();
+        let mut expected = 0u32;
+        let error = loop {
+            match merged.next_record() {
+                Ok(Some((key, value))) => {
+                    assert_eq!(key, expected.to_be_bytes());
+                    assert_eq!(value, format!("{expected:0100}").as_bytes());
+                    expected += 1;
+                }
+                Ok(None) => panic!("the merge ended without noticing the changed runs"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::InvalidData));
+        assert!(
+            error
+                .to_string()
+                .contains("is corrupt: a block does not match its checksum")
+        );
+        assert_eq!(entries(root.path()), 0);
+        assert!(matches!(merged.next_record(), Err(Error::Failed)));
     }
 
     #[test]

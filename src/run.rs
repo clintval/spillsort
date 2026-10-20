@@ -1,7 +1,10 @@
 //! Runs: files of sorted records, each a u32 key length, the key, a u32 value length, and the
-//! value, all little-endian. The records are cut into blocks of at most 128 KiB, wherever a record
-//! ends, and each block is compressed with LZ4 and written after its compressed and uncompressed
-//! lengths, as u32s, so a run is read a block at a time.
+//! value, all little-endian. The records are cut into blocks of 128 KiB, the last shorter, so a
+//! record may span blocks, and each block is compressed with LZ4 and written after its compressed
+//! and uncompressed lengths and a CRC-32 (IEEE, as zlib's) of the run's number, the block's index
+//! in the run, those lengths, and the compressed block, as u32s. A run is read a block at a time,
+//! and a block changed, moved, or repeated on disk, or a run overwritten with another's bytes, is
+//! an error before it is decompressed, and the same records make the same run wherever it is.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -11,15 +14,18 @@ use std::sync::Arc;
 
 use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 use rayon::ThreadPool;
-use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 use crate::with_path;
 
 /// The most bytes of records a block holds.
 const BLOCK: usize = 128 << 10;
 
-/// The bytes before each block: its compressed and uncompressed lengths.
-const HEADER: usize = 8;
+/// The bytes before each block: its compressed and uncompressed lengths, then their checksum.
+const HEADER: usize = 12;
+
+/// The bytes of a header that its checksum covers, before the checksum itself.
+const LENGTHS: usize = 8;
 
 /// The most blocks a run writer compresses at once, on a pool of any size.
 const MOST_BLOCKS: usize = 16;
@@ -27,10 +33,12 @@ const MOST_BLOCKS: usize = 16;
 /// The bytes a run writer gathers before writing them to its file.
 const WRITE_BUFFER: usize = 1 << 20;
 
-/// A run on disk, the number of records written to it, and the bytes they take uncompressed.
+/// A run on disk, its number among its sorter's runs, the number of records written to it, and
+/// the bytes they take uncompressed.
 #[derive(Clone, Debug)]
 pub(crate) struct Run {
     pub path: PathBuf,
+    pub number: u64,
     pub records: u64,
     pub bytes: u64,
 }
@@ -44,7 +52,17 @@ fn corrupt(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-/// A block of records, and the room to compress it into after its lengths.
+/// The CRC-32 of a block's run number, its index in the run, its lengths, and its compressed bytes.
+fn checksum(run: u64, index: u64, lengths: &[u8], compressed: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&run.to_le_bytes());
+    hasher.update(&index.to_le_bytes());
+    hasher.update(lengths);
+    hasher.update(compressed);
+    hasher.finalize()
+}
+
+/// A block of records, and the room to compress it into after its header.
 #[derive(Default)]
 struct Block {
     records: Vec<u8>,
@@ -53,7 +71,7 @@ struct Block {
 }
 
 impl Block {
-    fn compress(&mut self) -> io::Result<()> {
+    fn compress(&mut self, run: u64, index: u64) -> io::Result<()> {
         let most = HEADER + get_maximum_output_size(self.records.len());
         if self.compressed.len() < most {
             self.compressed.resize(most, 0);
@@ -61,7 +79,9 @@ impl Block {
         let (header, payload) = self.compressed.split_at_mut(HEADER);
         let size = compress_into(&self.records, payload).map_err(io::Error::other)?;
         header[..4].copy_from_slice(&(size as u32).to_le_bytes());
-        header[4..].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
+        header[4..LENGTHS].copy_from_slice(&(self.records.len() as u32).to_le_bytes());
+        let sum = checksum(run, index, &header[..LENGTHS], &payload[..size]);
+        header[LENGTHS..].copy_from_slice(&sum.to_le_bytes());
         self.written = HEADER + size;
         Ok(())
     }
@@ -76,12 +96,14 @@ pub(crate) struct RunWriter {
     pool: Option<Arc<ThreadPool>>,
     blocks: Vec<Block>,
     filling: usize,
+    number: u64,
+    index: u64,
     records: u64,
     bytes: u64,
 }
 
 impl RunWriter {
-    pub fn create(path: PathBuf, pool: Option<Arc<ThreadPool>>) -> io::Result<Self> {
+    pub fn create(path: PathBuf, number: u64, pool: Option<Arc<ThreadPool>>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -96,6 +118,8 @@ impl RunWriter {
             pool,
             blocks: (0..blocks).map(|_| Block::default()).collect(),
             filling: 0,
+            number,
+            index: 0,
             records: 0,
             bytes: 0,
         })
@@ -125,6 +149,7 @@ impl RunWriter {
             .map_err(|error| with_path(error, &self.path))?;
         Ok(Run {
             path: self.path,
+            number: self.number,
             records: self.records,
             bytes: self.bytes,
         })
@@ -157,13 +182,16 @@ impl RunWriter {
             .iter()
             .take_while(|block| !block.records.is_empty())
             .count();
-        let blocks = &mut self.blocks[..filled];
+        let (blocks, run, first) = (&mut self.blocks[..filled], self.number, self.index);
+        let compress =
+            move |(index, block): (usize, &mut Block)| block.compress(run, first + index as u64);
         match &self.pool {
             Some(pool) if filled > 1 => {
-                pool.install(|| blocks.par_iter_mut().try_for_each(Block::compress))?;
+                pool.install(|| blocks.par_iter_mut().enumerate().try_for_each(compress))?;
             }
-            _ => blocks.iter_mut().try_for_each(Block::compress)?,
+            _ => blocks.iter_mut().enumerate().try_for_each(compress)?,
         }
+        self.index += filled as u64;
         for block in blocks {
             self.file.write_all(&block.compressed[..block.written])?;
             block.records.clear();
@@ -182,6 +210,8 @@ pub(crate) struct RunReader {
     ahead: Range<usize>,
     block: Vec<u8>,
     read: usize,
+    number: u64,
+    index: u64,
     left: u64,
     bytes_left: u64,
 }
@@ -196,6 +226,8 @@ impl RunReader {
             ahead: 0..0,
             block: Vec::new(),
             read: 0,
+            number: run.number,
+            index: 0,
             left: run.records,
             bytes_left: run.bytes,
         })
@@ -258,16 +290,18 @@ impl RunReader {
         Ok(self.block.len() - self.read)
     }
 
-    /// Reads and decompresses the next block, checking its lengths before allocating for it, in
-    /// one read that takes as much of the next block's header as the file has, kept in `ahead`.
+    /// Reads and decompresses the next block, checking its lengths before allocating for it and
+    /// its checksum before decompressing it, in one read that takes as much of the next block's
+    /// header as the file has, kept in `ahead`.
     fn read_block(&mut self) -> io::Result<()> {
         let mut header = [0u8; HEADER];
         let ahead = self.ahead.len();
         header[..ahead].copy_from_slice(&self.compressed[self.ahead.clone()]);
         self.file.read_exact(&mut header[ahead..])?;
-        let [c0, c1, c2, c3, u0, u1, u2, u3] = header;
+        let [c0, c1, c2, c3, u0, u1, u2, u3, s0, s1, s2, s3] = header;
         let size = u32::from_le_bytes([c0, c1, c2, c3]) as usize;
         let length = u32::from_le_bytes([u0, u1, u2, u3]) as usize;
+        let sum = u32::from_le_bytes([s0, s1, s2, s3]);
         if length == 0 || length > BLOCK || size == 0 || size > get_maximum_output_size(length) {
             return Err(corrupt("a block has an impossible length"));
         }
@@ -277,6 +311,16 @@ impl RunReader {
         }
         let read = read_at_least(&mut self.file, &mut self.compressed[..size + HEADER], size)?;
         self.ahead = size..read;
+        if checksum(
+            self.number,
+            self.index,
+            &header[..LENGTHS],
+            &self.compressed[..size],
+        ) != sum
+        {
+            return Err(corrupt("a block does not match its checksum"));
+        }
+        self.index += 1;
         self.block.resize(length, 0);
         self.read = 0;
         match decompress_into(&self.compressed[..size], &mut self.block) {
@@ -312,8 +356,10 @@ mod tests {
 
     use super::*;
 
+    type Records = Vec<(Vec<u8>, Vec<u8>)>;
+
     fn write(path: PathBuf, records: &[(&[u8], &[u8])]) -> Run {
-        let mut writer = RunWriter::create(path, None).unwrap();
+        let mut writer = RunWriter::create(path, 0, None).unwrap();
         for (key, value) in records {
             writer.push(key, value).unwrap();
         }
@@ -350,12 +396,40 @@ mod tests {
 
     /// A run of many records, spanning several blocks.
     fn long_run(path: PathBuf) -> Run {
-        let mut writer = RunWriter::create(path, None).unwrap();
+        let mut writer = RunWriter::create(path, 0, None).unwrap();
         for index in 0u32..50_000 {
             let value = format!("chr{}\t{index}\tread{index}\n", index % 22);
             writer.push(&index.to_be_bytes(), value.as_bytes()).unwrap();
         }
         writer.finish().unwrap()
+    }
+
+    /// A run of records that do not compress, spanning several blocks.
+    fn noise_run(path: PathBuf) -> Run {
+        let values = noise(4 * BLOCK);
+        let records: Vec<(&[u8], &[u8])> = values
+            .chunks(64)
+            .map(|value| (&b"key"[..], value))
+            .collect();
+        write(path, &records)
+    }
+
+    /// A run numbered `number` of 64-byte records, keyed from `first`, that fill `blocks` blocks
+    /// exactly, and its records.
+    fn block_aligned_run(path: PathBuf, number: u64, blocks: usize, first: u64) -> (Run, Records) {
+        let values = noise(48 * blocks * BLOCK / 64);
+        let expected: Records = values
+            .chunks(48)
+            .zip(first..)
+            .map(|(value, key)| (key.to_be_bytes().to_vec(), value.to_vec()))
+            .collect();
+        let mut writer = RunWriter::create(path, number, None).unwrap();
+        for (key, value) in &expected {
+            writer.push(key, value).unwrap();
+        }
+        let run = writer.finish().unwrap();
+        assert_eq!(run.bytes, (blocks * BLOCK) as u64);
+        (run, expected)
     }
 
     /// The offset of each block in a run's bytes.
@@ -371,9 +445,50 @@ mod tests {
         offsets
     }
 
+    /// Rewrites the checksum of a run's block at `index` to match the bytes it now holds.
+    fn seal(run: &Run, bytes: &mut [u8], index: usize) {
+        let offset = block_offsets(bytes)[index];
+        let size = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let payload = offset + HEADER;
+        let lengths = &bytes[offset..offset + LENGTHS];
+        let sum = checksum(
+            run.number,
+            index as u64,
+            lengths,
+            &bytes[payload..payload + size],
+        );
+        bytes[offset + LENGTHS..payload].copy_from_slice(&sum.to_le_bytes());
+    }
+
     fn assert_error(error: &io::Error, kind: io::ErrorKind, reason: &str) {
         assert_eq!(error.kind(), kind);
         assert!(error.to_string().contains(reason), "{error}");
+    }
+
+    /// Checks that reading a run fails as corrupt, naming it, after only the records expected.
+    fn assert_corrupt_after_right_records(run: &Run, expected: &[(Vec<u8>, Vec<u8>)]) {
+        let mut reader = RunReader::open(run).unwrap();
+        let (mut key, mut value) = (Vec::new(), Vec::new());
+        let mut read = 0;
+        let error = loop {
+            match reader.read_into(&mut key, &mut value) {
+                Ok(true) => {
+                    assert!(
+                        key == expected[read].0 && value == expected[read].1,
+                        "record {read}"
+                    );
+                    read += 1;
+                }
+                Ok(false) => panic!("read all {read} records without an error"),
+                Err(error) => break error,
+            }
+        };
+        assert_error(&error, InvalidData, &run.path.to_string_lossy());
+        assert_error(
+            &error,
+            InvalidData,
+            "is corrupt: a block does not match its checksum",
+        );
     }
 
     /// Checks that reading a run fails with this kind of error, naming the run and the reason.
@@ -424,7 +539,7 @@ mod tests {
             .unwrap();
         let alone = long_run(dir.path().join("alone"));
         let mut writer =
-            RunWriter::create(dir.path().join("pooled"), Some(Arc::new(pool))).unwrap();
+            RunWriter::create(dir.path().join("pooled"), 0, Some(Arc::new(pool))).unwrap();
         assert_eq!(writer.blocks.len(), 6);
         for (key, value) in read(&alone).unwrap() {
             writer.push(&key, &value).unwrap();
@@ -445,7 +560,7 @@ mod tests {
                 .build()
                 .unwrap();
             let path = dir.path().join(format!("{threads}"));
-            let writer = RunWriter::create(path, Some(Arc::new(pool))).unwrap();
+            let writer = RunWriter::create(path, 0, Some(Arc::new(pool))).unwrap();
             assert_eq!(writer.blocks.len(), blocks, "{threads} threads");
         }
     }
@@ -453,7 +568,7 @@ mod tests {
     #[test]
     fn a_writer_gathers_blocks_before_writing_them() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = RunWriter::create(dir.path().join("run"), None).unwrap();
+        let mut writer = RunWriter::create(dir.path().join("run"), 0, None).unwrap();
         while writer.bytes < 4 * BLOCK as u64 {
             writer
                 .push(b"key", b"a value that compresses well")
@@ -505,6 +620,20 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_ends_within_any_block_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = long_run(dir.path().join("run"));
+        let bytes = fs::read(&run.path).unwrap();
+        let offsets = block_offsets(&bytes);
+        assert!(offsets.len() > 4);
+        let ends = offsets.iter().skip(1).copied().chain([bytes.len()]);
+        for (start, end) in offsets.iter().zip(ends) {
+            fs::write(&run.path, &bytes[..(start + HEADER + end) / 2]).unwrap();
+            assert_unreadable(&run, UnexpectedEof, "ended before its last record");
+        }
+    }
+
+    #[test]
     fn a_run_that_ends_after_a_whole_block_or_within_a_header_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let run = long_run(dir.path().join("run"));
@@ -518,13 +647,104 @@ mod tests {
     }
 
     #[test]
-    fn a_garbled_block_is_corrupt() {
+    fn a_changed_byte_in_a_block_or_its_checksum_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = noise_run(dir.path().join("run"));
+        let bytes = fs::read(&run.path).unwrap();
+        let offsets = block_offsets(&bytes);
+        let (start, end) = (offsets[1], offsets[2]);
+        for at in [
+            start + LENGTHS,
+            start + HEADER - 1,
+            start + HEADER,
+            start + HEADER + 200,
+            end - 1,
+        ] {
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            fs::write(&run.path, &changed).unwrap();
+            assert_unreadable(
+                &run,
+                InvalidData,
+                "is corrupt: a block does not match its checksum",
+            );
+        }
+        let last = offsets[offsets.len() - 1] + 4;
+        let length = u32::from_le_bytes(bytes[last..last + 4].try_into().unwrap());
+        assert!(length < BLOCK as u32);
+        for wrong in [length - 1, length + 1] {
+            let mut changed = bytes.clone();
+            changed[last..last + 4].copy_from_slice(&wrong.to_le_bytes());
+            fs::write(&run.path, &changed).unwrap();
+            assert_unreadable(
+                &run,
+                InvalidData,
+                "is corrupt: a block does not match its checksum",
+            );
+        }
+    }
+
+    #[test]
+    fn a_flipped_bit_in_any_header_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = noise_run(dir.path().join("run"));
+        let bytes = fs::read(&run.path).unwrap();
+        for offset in block_offsets(&bytes) {
+            for at in offset..offset + HEADER {
+                for bit in 0..8 {
+                    let mut changed = bytes.clone();
+                    changed[at] ^= 1 << bit;
+                    fs::write(&run.path, &changed).unwrap();
+                    let error = read(&run).unwrap_err();
+                    assert!(
+                        matches!(error.kind(), InvalidData | UnexpectedEof),
+                        "{error}"
+                    );
+                    assert!(error.to_string().contains(&*run.path.to_string_lossy()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_blocks_swapped_or_repeated_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, expected) = block_aligned_run(dir.path().join("run"), 0, 5, 0);
+        let bytes = fs::read(&run.path).unwrap();
+        let [_, one, two, three, _] = block_offsets(&bytes)[..] else {
+            panic!("the run is not 5 blocks");
+        };
+        let swapped = [
+            &bytes[..one],
+            &bytes[two..three],
+            &bytes[one..two],
+            &bytes[three..],
+        ];
+        let repeated = [&bytes[..two], &bytes[one..two], &bytes[two..]];
+        for changed in [swapped.concat(), repeated.concat()] {
+            fs::write(&run.path, &changed).unwrap();
+            assert_corrupt_after_right_records(&run, &expected);
+        }
+    }
+
+    #[test]
+    fn a_run_overwritten_with_another_runs_bytes_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = block_aligned_run(dir.path().join("first"), 0, 2, 0);
+        let (second, expected) = block_aligned_run(dir.path().join("second"), 1, 2, 1 << 32);
+        fs::copy(&first.path, &second.path).unwrap();
+        assert_corrupt_after_right_records(&second, &expected);
+    }
+
+    #[test]
+    fn a_block_that_matches_its_checksum_but_does_not_decompress_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let run = long_run(dir.path().join("run"));
         let bytes = fs::read(&run.path).unwrap();
         let offsets = block_offsets(&bytes);
         let mut garbled = bytes.clone();
-        garbled[offsets[1] + HEADER..].fill(0);
+        garbled[offsets[1] + HEADER..offsets[2]].fill(0);
+        seal(&run, &mut garbled, 1);
         fs::write(&run.path, &garbled).unwrap();
         assert_unreadable(&run, InvalidData, "is corrupt: a block does not decompress");
 
@@ -534,6 +754,7 @@ mod tests {
         for wrong in [length - 1, length + 1] {
             let mut garbled = bytes.clone();
             garbled[last..last + 4].copy_from_slice(&wrong.to_le_bytes());
+            seal(&run, &mut garbled, offsets.len() - 1);
             fs::write(&run.path, &garbled).unwrap();
             assert_unreadable(&run, InvalidData, "is corrupt: a block does not decompress");
         }
@@ -553,7 +774,7 @@ mod tests {
             [&0u32.to_le_bytes(), &block],
         ];
         for [size, length] in headers {
-            let garbled = [size, length, &bytes[HEADER..]].concat();
+            let garbled = [size, length, &bytes[LENGTHS..]].concat();
             fs::write(&run.path, &garbled).unwrap();
             let mut reader = RunReader::open(&run).unwrap();
             let (mut key, mut value) = (Vec::new(), Vec::new());
@@ -570,7 +791,7 @@ mod tests {
     #[test]
     fn a_length_past_the_end_of_a_run_is_corrupt_and_allocates_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = RunWriter::create(dir.path().join("run"), None).unwrap();
+        let mut writer = RunWriter::create(dir.path().join("run"), 0, None).unwrap();
         writer.write_bytes(&u32::MAX.to_le_bytes()).unwrap();
         writer.write_bytes(&[7; 100]).unwrap();
         let run = Run {
@@ -588,7 +809,7 @@ mod tests {
     #[test]
     fn a_reader_holds_a_block_and_the_most_it_compresses_to_however_well_blocks_compress() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = RunWriter::create(dir.path().join("run"), None).unwrap();
+        let mut writer = RunWriter::create(dir.path().join("run"), 0, None).unwrap();
         let mut state = 5u64;
         let mut random = || {
             state = state
@@ -632,6 +853,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let run = Run {
             path: dir.path().join("missing"),
+            number: 0,
             records: 1,
             bytes: 10,
         };
@@ -645,7 +867,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run");
         write(path.clone(), &[]);
-        let error = RunWriter::create(path, None).map(|_| ()).unwrap_err();
+        let error = RunWriter::create(path, 0, None).map(|_| ()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 }
