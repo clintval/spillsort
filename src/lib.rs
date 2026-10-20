@@ -53,6 +53,9 @@ pub use sorter::{
 struct ReadmeDoctests;
 
 /// An error from sorting or merging.
+///
+/// An [`Error::Io`] shows its I/O error's message, so its source is that error's source, not the
+/// error itself, and a report of the chain names each cause once.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -83,7 +86,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io(error) => Some(error),
+            Error::Io(error) => error.source(),
             Error::Invalid(_) | Error::Failed => None,
         }
     }
@@ -91,3 +94,34 @@ impl std::error::Error for Error {
 
 /// A result whose error is an [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::{Config, Sorter};
+
+    /// Prints an error and each of its sources, as `anyhow` prints a chain with `{:#}`.
+    fn report(error: &dyn std::error::Error) -> String {
+        let mut report = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            report = format!("{report}: {cause}");
+            source = cause.source();
+        }
+        report
+    }
+
+    #[test]
+    fn a_report_of_an_error_names_its_path_and_reason_once() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let reason = fs::metadata(&missing).unwrap_err().to_string();
+        let error = Sorter::new(Config::default().tmp_dir(&missing)).unwrap_err();
+        let report = report(&error);
+        assert_eq!(report, error.to_string());
+        let path = missing.to_string_lossy();
+        assert_eq!(report.matches(&*path).count(), 1, "{report}");
+        assert_eq!(report.matches(&reason).count(), 1, "{report}");
+    }
+}
