@@ -39,6 +39,11 @@ class Sorter(Generic[_T]):
     or when the sorter is garbage collected. Threads sharing a sorter take turns, and a sorter
     must not be shared across a fork: make a new one in the child.
 
+    Runs last only as long as the sort, so they are never synced to disk. A write error that a
+    file system reports late, as NFS and Lustre may at close, goes unseen when a run is written,
+    but no item it lost can come back wrong: reading a run checks its item count and each block's
+    checksum, so sorting raises OSError naming the run.
+
     Ctrl-C, or any signal handler that raises, interrupts waiting for a spill, merging, and
     reading; an interrupted merge or read ends the sort and removes what was spilled, which can take
     a moment when much was spilled, and the sorter then refuses to be read again.

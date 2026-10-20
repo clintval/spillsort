@@ -7,6 +7,11 @@
 //! compressed with LZ4, to a temporary file, a run, while the other half fills.
 //! [`Sorter::finish`] merges the runs with the records still held and returns them in order.
 //!
+//! Runs last only as long as the sort, so they are never synced to disk. A write error that a
+//! file system reports late, as NFS and Lustre may at close, goes unseen when a run is written,
+//! but no record it lost can come back wrong: reading a run checks its record count and each
+//! block's checksum, so the merge fails with an error naming the run.
+//!
 //! The [`key`] module builds keys from numbers, text, bytes, and tuples of them, and their bytes
 //! compare as those values do in Python. A key built from several fields sorts field by field.
 //!
