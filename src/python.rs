@@ -866,8 +866,8 @@ impl Drop for SortedIterator {
     }
 }
 
-#[pymodule(gil_used = false)]
-fn _spillsort(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule(name = "_spillsort", gil_used = false)]
+fn spillsort_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySorter>()?;
     Ok(())
 }
